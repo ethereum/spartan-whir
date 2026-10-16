@@ -19,7 +19,7 @@ flowchart LR
     H -->|"proof"| A["Application"]
 ```
 
-The frontend is the [KoalaBear Circom fork](https://github.com/alxkzmn/circom/tree/koala-bear). The proof system combines [Spartan](https://eprint.iacr.org/2019/550) with the [Plonky3 WHIR implementation](https://github.com/Plonky3/Plonky3/tree/main/whir). Full-ZK proving follows [Zero-Knowledge IOPPs for Constrained Interleaved Codes](https://eprint.iacr.org/2026/391).
+The frontend is the [KoalaBear Circom fork](https://github.com/Client-Side-Proving/circom/tree/koala-bear). The proof system combines [Spartan](https://eprint.iacr.org/2019/550) with the [Plonky3 WHIR implementation](https://github.com/Plonky3/Plonky3/tree/main/whir). Full-ZK proving follows [Zero-Knowledge IOPPs for Constrained Interleaved Codes](https://eprint.iacr.org/2026/391).
 
 ## Quick Start
 

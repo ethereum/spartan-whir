@@ -1,6 +1,9 @@
 #[path = "../../benches/support/sha256.rs"]
 mod sha256_fixture;
 
+#[cfg(feature = "poseidon1")]
+use spartan_whir::withdrawal::config::configured_withdrawal_spark_config;
+
 use std::{
     collections::BTreeMap,
     env,
@@ -46,7 +49,6 @@ use spartan_whir::{
 };
 
 const MESSAGE_BYTES: usize = 2_048;
-const SAMPLE_INDEX: usize = 0;
 const PROOF_SEED: u64 = 0x5A17_5041_524B_0001;
 
 #[derive(Serialize)]
@@ -86,23 +88,109 @@ fn run() -> Result<(), Box<dyn Error>> {
 
     let mut args = env::args_os().skip(1);
     let output = args.next().map(PathBuf::from).unwrap_or_else(|| usage());
-    if args.next().is_some() {
-        usage();
+    let mut circuit = String::from("sha256");
+    let mut sample = 0_u64;
+    let mut setup_config_path = None;
+    while let Some(argument) = args.next() {
+        match argument.to_str() {
+            Some("--circuit") => {
+                circuit = args
+                    .next()
+                    .and_then(|value| value.into_string().ok())
+                    .unwrap_or_else(|| usage());
+            }
+            Some("--sample") => {
+                sample = args
+                    .next()
+                    .and_then(|value| value.into_string().ok())
+                    .and_then(|value| value.parse().ok())
+                    .unwrap_or_else(|| usage());
+            }
+            Some("--setup-config") => {
+                setup_config_path = Some(args.next().map(PathBuf::from).unwrap_or_else(|| usage()));
+            }
+            _ => usage(),
+        }
     }
     fs::create_dir_all(&output)?;
 
     let load_started = Instant::now();
-    let fixture = sha256_fixture::Sha256Fixture::load(MESSAGE_BYTES)?;
-    let load_elapsed = load_started.elapsed();
-    let message = sha256_fixture::message(MESSAGE_BYTES, SAMPLE_INDEX);
-    let input = sha256_fixture::input_binary(&message);
-    fixture.validate_input(&message, &input)?;
+    let (shape, witness, public_inputs, application) = match circuit.as_str() {
+        "sha256" => {
+            let fixture = sha256_fixture::Sha256Fixture::load(MESSAGE_BYTES)?;
+            let message = sha256_fixture::message(MESSAGE_BYTES, usize::try_from(sample)?);
+            let input = sha256_fixture::input_binary(&message);
+            fixture.validate_input(&message, &input)?;
+            let (witness, public_inputs) = fixture.generator.generate_witness(
+                &input,
+                fixture.shape.num_vars,
+                fixture.shape.num_io,
+            )?;
+            (
+                fixture.shape,
+                witness,
+                public_inputs,
+                json!({
+                    "id": "sha256-2048-byte-optimized-v1",
+                    "message_bytes": MESSAGE_BYTES,
+                }),
+            )
+        }
+        "privacy-pools" => {
+            let fixture =
+                spartan_whir::withdrawal::deterministic_withdrawal_fixture_for_sample(sample);
+            let application = json!({
+                "id": "privacy-pools-withdrawal-poseidon2-v1",
+                "state_tree_depth": 32,
+                "asp_tree_depth": 32,
+                "hash": "poseidon2-koalabear-width24-rate16-capacity8-digest8",
+                "amount_bits": 128,
+                "constraints": fixture.stats.constraints,
+                "witness_variables": fixture.stats.witness_variables,
+                "public_inputs": fixture.stats.public_inputs,
+                "poseidon_permutations": fixture.stats.poseidon_permutations,
+                "matrix_nonzeros": fixture.stats.matrix_nonzeros,
+            });
+            (
+                fixture.shape,
+                fixture.witness,
+                fixture.public_inputs,
+                application,
+            )
+        }
+        _ => return Err(io::Error::other("--circuit must be sha256 or privacy-pools").into()),
+    };
+    let preparation_elapsed = load_started.elapsed();
+    spartan_whir::validate_satisfaction(&shape, &witness, &public_inputs)?;
+    let relation_digest = spartan_whir::canonical_r1cs_relation_digest(
+        &shape.pad_regular().map_err(protocol_error)?,
+        shape.num_cons,
+        shape.num_vars,
+        shape.num_io,
+    )
+    .map_err(protocol_error)?;
 
-    let config = production_spark_config(&fixture.shape)?;
+    let config = match circuit.as_str() {
+        #[cfg(feature = "poseidon1")]
+        "privacy-pools" => configured_withdrawal_spark_config(setup_config_path.as_deref())?,
+        _ => {
+            if setup_config_path.is_some() {
+                return Err(
+                    io::Error::other("--setup-config requires --circuit privacy-pools").into(),
+                );
+            }
+            production_spark_config(&shape)?
+        }
+    };
     let setup_started = Instant::now();
+    let default_batching = if circuit == "privacy-pools" {
+        "same_height"
+    } else {
+        "separate"
+    };
     let batching = match env::var("SPARK_FRESH_MASK_BATCHING")
         .as_deref()
-        .unwrap_or("separate")
+        .unwrap_or(default_batching)
     {
         "separate" => spartan_whir::pcs_config::FreshMaskBatching::Separate,
         "same_height" => spartan_whir::pcs_config::FreshMaskBatching::SameHeight,
@@ -113,7 +201,15 @@ fn run() -> Result<(), Box<dyn Error>> {
             .into())
         }
     };
-    let packing = match env::var("SPARK_MASK_PACKING").as_deref().unwrap_or("off") {
+    let default_packing = if circuit == "privacy-pools" {
+        "all_free_basis"
+    } else {
+        "off"
+    };
+    let packing = match env::var("SPARK_MASK_PACKING")
+        .as_deref()
+        .unwrap_or(default_packing)
+    {
         "off" => spartan_whir::pcs_config::MaskPacking::Off,
         "application" => spartan_whir::pcs_config::MaskPacking::Application,
         "all" => spartan_whir::pcs_config::MaskPacking::All,
@@ -122,24 +218,22 @@ fn run() -> Result<(), Box<dyn Error>> {
         _ => return Err(io::Error::other("unknown SPARK_MASK_PACKING").into()),
     };
     let (pk, vk) = spartan_whir::poseidon::setup_poseidon_zk_with_mask_packing::<GuestEngine>(
-        fixture.shape.clone(),
+        shape.clone(),
         config.clone(),
         batching,
         packing,
     )
     .map_err(protocol_error)?;
     let setup_elapsed = setup_started.elapsed();
-
-    let witness_started = Instant::now();
-    let (witness, public_inputs) =
-        fixture
-            .generator
-            .generate_witness(&input, fixture.shape.num_vars, fixture.shape.num_io)?;
-    let witness_elapsed = witness_started.elapsed();
+    println!(
+        "setup completed in {:.3} ms; starting proof",
+        setup_elapsed.as_secs_f64() * 1_000.0
+    );
 
     let prove_started = Instant::now();
     let mut prover_challenger = poseidon_zk_challenger();
-    let mut rng = StdRng::seed_from_u64(PROOF_SEED);
+    let proof_seed = PROOF_SEED.wrapping_add(sample);
+    let mut rng = StdRng::seed_from_u64(proof_seed);
     let (instance, proof) = PoseidonZkSpartanProtocol::<QuinticExtension>::prove_with_rng(
         &pk,
         &public_inputs,
@@ -149,6 +243,10 @@ fn run() -> Result<(), Box<dyn Error>> {
     )
     .map_err(protocol_error)?;
     let prove_elapsed = prove_started.elapsed();
+    println!(
+        "proof completed in {:.3} ms; starting verification",
+        prove_elapsed.as_secs_f64() * 1_000.0
+    );
 
     let verify_started = Instant::now();
     let mut verifier_challenger = poseidon_zk_challenger().with_trace();
@@ -217,15 +315,28 @@ fn run() -> Result<(), Box<dyn Error>> {
 
     let manifest = json!({
         "schema": "leanvm-full-zk-spark-fixture-v1",
-        "application": "sha256-2048-byte-optimized-v1",
+        "application": application["id"],
+        "application_details": application,
         "statement_schema": FULL_ZK_STATEMENT_SCHEMA_ID,
         "hash_profile": "poseidon1-width16",
         "matrix_closing": "spark",
         "extension": "X^5 + X^2 - 1",
         "extension_degree": 5,
-        "message_bytes": MESSAGE_BYTES,
-        "sample_index": SAMPLE_INDEX,
-        "proof_seed": PROOF_SEED,
+        "sample_index": sample,
+        "proof_seed": proof_seed,
+        "relation_digest": relation_digest,
+        "raw_shape": {
+            "constraints": shape.num_cons,
+            "variables": shape.num_vars,
+            "public_inputs": shape.num_io,
+            "matrix_nonzeros": shape.a.nnz() + shape.b.nnz() + shape.c.nnz(),
+        },
+        "diagnostic_times_ms": {
+            "circuit_and_input_preparation": preparation_elapsed.as_secs_f64() * 1_000.0,
+            "setup": setup_elapsed.as_secs_f64() * 1_000.0,
+            "prove": prove_elapsed.as_secs_f64() * 1_000.0,
+            "verify": verify_elapsed.as_secs_f64() * 1_000.0,
+        },
         "setup": config,
         "canonical_shape": {
             "constraints": verifier_config.common.canonical_shape.constraints,
@@ -256,10 +367,9 @@ fn run() -> Result<(), Box<dyn Error>> {
     );
     println!("recorded {} transcript events", trace.len());
     println!(
-        "fixture load {:.3} ms, setup {:.3} ms, witness {:.3} ms, prove {:.3} ms, verify {:.3} ms",
-        load_elapsed.as_secs_f64() * 1_000.0,
+        "circuit and input preparation {:.3} ms, setup {:.3} ms, prove {:.3} ms, verify {:.3} ms",
+        preparation_elapsed.as_secs_f64() * 1_000.0,
         setup_elapsed.as_secs_f64() * 1_000.0,
-        witness_elapsed.as_secs_f64() * 1_000.0,
         prove_elapsed.as_secs_f64() * 1_000.0,
         verify_elapsed.as_secs_f64() * 1_000.0
     );
@@ -1029,7 +1139,7 @@ fn artifact(output: &Path, path: &Path) -> Result<Artifact, Box<dyn Error>> {
 }
 
 fn usage() -> ! {
-    eprintln!("usage: leanvm-full-zk-spark-fixture <output-directory>");
+    eprintln!("usage: leanvm-full-zk-spark-fixture <output-directory> [--circuit sha256|privacy-pools] [--sample N] [--setup-config JSON]");
     process::exit(2)
 }
 

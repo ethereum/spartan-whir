@@ -31,6 +31,7 @@ pub mod statement;
 pub mod sumcheck;
 mod sumcheck_replay;
 pub mod whir_params;
+pub mod withdrawal;
 
 pub use canonical_challenger::CanonicalSerializingChallenger32;
 pub use circom::{

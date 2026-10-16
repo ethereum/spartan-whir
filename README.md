@@ -196,6 +196,20 @@ cargo test protocol_e2e_target_2_pow_22 -- --ignored
 
 Benchmark outputs are local development artifacts. Write reports under the ignored `benchmark-results/` directory and update the dated results below after a relevant implementation or configuration change.
 
+#### Privacy Pools-style withdrawal
+
+The [withdrawal benchmark](src/withdrawal.rs) uses two depth-32 Merkle paths, Poseidon2 hashing, and 128-bit balance conservation, with about 64,000 constraints. It models withdrawal semantics using KoalaBear fields and balanced binary trees.
+
+Run the full-ZK SPARK benchmark with Poseidon1 proof hashing:
+
+```bash
+RUSTFLAGS='-C target-cpu=native -C debuginfo=0' \
+RAYON_NUM_THREADS=12 \
+cargo bench --features parallel,poseidon1 --bench withdrawal_full_zk
+```
+
+Criterion measures witness generation, witness generation plus proving, and verification separately. Set `WITHDRAWAL_SPARK_CONFIG` to a JSON configuration file to override the [default proving settings](src/withdrawal/config.rs), which are shared with recursive fixture export.
+
 #### SHA-256 proving and verification
 
 Build the optimized 2,048-byte SHA-256 R1CS and linked witness generator:

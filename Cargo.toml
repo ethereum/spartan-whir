@@ -8,21 +8,21 @@ name = "spartan_whir"
 path = "src/lib.rs"
 
 [dependencies]
-p3-challenger = { git = "https://github.com/alxkzmn/Plonky3.git", rev = "47d8983dfd78101685592884cd3322a922fa745e" }
-p3-commit = { git = "https://github.com/alxkzmn/Plonky3.git", rev = "47d8983dfd78101685592884cd3322a922fa745e" }
-p3-dft = { git = "https://github.com/alxkzmn/Plonky3.git", rev = "47d8983dfd78101685592884cd3322a922fa745e" }
-p3-field = { git = "https://github.com/alxkzmn/Plonky3.git", rev = "47d8983dfd78101685592884cd3322a922fa745e" }
-p3-baby-bear = { git = "https://github.com/alxkzmn/Plonky3.git", rev = "47d8983dfd78101685592884cd3322a922fa745e" }
-p3-keccak = { git = "https://github.com/alxkzmn/Plonky3.git", rev = "47d8983dfd78101685592884cd3322a922fa745e" }
-p3-koala-bear = { git = "https://github.com/alxkzmn/Plonky3.git", rev = "47d8983dfd78101685592884cd3322a922fa745e" }
-p3-matrix = { git = "https://github.com/alxkzmn/Plonky3.git", rev = "47d8983dfd78101685592884cd3322a922fa745e" }
-p3-maybe-rayon = { git = "https://github.com/alxkzmn/Plonky3.git", rev = "47d8983dfd78101685592884cd3322a922fa745e" }
-p3-merkle-tree = { git = "https://github.com/alxkzmn/Plonky3.git", rev = "47d8983dfd78101685592884cd3322a922fa745e" }
-p3-multilinear-util = { git = "https://github.com/alxkzmn/Plonky3.git", rev = "47d8983dfd78101685592884cd3322a922fa745e" }
-p3-sumcheck = { git = "https://github.com/alxkzmn/Plonky3.git", rev = "47d8983dfd78101685592884cd3322a922fa745e" }
-p3-symmetric = { git = "https://github.com/alxkzmn/Plonky3.git", rev = "47d8983dfd78101685592884cd3322a922fa745e" }
-p3-util = { git = "https://github.com/alxkzmn/Plonky3.git", rev = "47d8983dfd78101685592884cd3322a922fa745e" }
-p3-whir = { git = "https://github.com/alxkzmn/Plonky3.git", rev = "47d8983dfd78101685592884cd3322a922fa745e" }
+p3-challenger = { git = "https://github.com/Client-Side-Proving/Plonky3.git", rev = "458ef546a251ab4d9d73c453d24a414334786ca0" }
+p3-commit = { git = "https://github.com/Client-Side-Proving/Plonky3.git", rev = "458ef546a251ab4d9d73c453d24a414334786ca0" }
+p3-dft = { git = "https://github.com/Client-Side-Proving/Plonky3.git", rev = "458ef546a251ab4d9d73c453d24a414334786ca0" }
+p3-field = { git = "https://github.com/Client-Side-Proving/Plonky3.git", rev = "458ef546a251ab4d9d73c453d24a414334786ca0" }
+p3-baby-bear = { git = "https://github.com/Client-Side-Proving/Plonky3.git", rev = "458ef546a251ab4d9d73c453d24a414334786ca0" }
+p3-keccak = { git = "https://github.com/Client-Side-Proving/Plonky3.git", rev = "458ef546a251ab4d9d73c453d24a414334786ca0" }
+p3-koala-bear = { git = "https://github.com/Client-Side-Proving/Plonky3.git", rev = "458ef546a251ab4d9d73c453d24a414334786ca0" }
+p3-matrix = { git = "https://github.com/Client-Side-Proving/Plonky3.git", rev = "458ef546a251ab4d9d73c453d24a414334786ca0" }
+p3-maybe-rayon = { git = "https://github.com/Client-Side-Proving/Plonky3.git", rev = "458ef546a251ab4d9d73c453d24a414334786ca0" }
+p3-merkle-tree = { git = "https://github.com/Client-Side-Proving/Plonky3.git", rev = "458ef546a251ab4d9d73c453d24a414334786ca0" }
+p3-multilinear-util = { git = "https://github.com/Client-Side-Proving/Plonky3.git", rev = "458ef546a251ab4d9d73c453d24a414334786ca0" }
+p3-sumcheck = { git = "https://github.com/Client-Side-Proving/Plonky3.git", rev = "458ef546a251ab4d9d73c453d24a414334786ca0" }
+p3-symmetric = { git = "https://github.com/Client-Side-Proving/Plonky3.git", rev = "458ef546a251ab4d9d73c453d24a414334786ca0" }
+p3-util = { git = "https://github.com/Client-Side-Proving/Plonky3.git", rev = "458ef546a251ab4d9d73c453d24a414334786ca0" }
+p3-whir = { git = "https://github.com/Client-Side-Proving/Plonky3.git", rev = "458ef546a251ab4d9d73c453d24a414334786ca0" }
 libloading = "0.8"
 bincode = "1.3"
 num-bigint = { version = "0.5.1", default-features = false }
@@ -89,6 +89,11 @@ lto = "fat"
 
 [[bench]]
 name = "spark_proof_compression"
+harness = false
+required-features = ["parallel", "poseidon1"]
+
+[[bench]]
+name = "withdrawal_full_zk"
 harness = false
 required-features = ["parallel", "poseidon1"]
 

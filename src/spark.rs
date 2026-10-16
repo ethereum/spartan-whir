@@ -401,6 +401,50 @@ pub struct SparkBatchedMemoryProductsProof<EF> {
     pub proof_mem: SparkBatchedProductProof<EF>,
 }
 
+/// Round messages for a product layer in the compact transport encoding.
+///
+/// The factored form stores the nonconstant coefficients of the quadratic
+/// quotient by the known equality factor. Decoding restores the original
+/// cubic observations before advancing the transcript.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CompactSparkProductRounds<EF> {
+    Factored(Vec<[EF; 2]>),
+    Cubic(Vec<CubicRoundPoly<EF>>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompactSparkProductLayerProof<EF> {
+    pub rounds: CompactSparkProductRounds<EF>,
+    pub product_left_evals: Vec<EF>,
+    pub product_right_evals: Vec<EF>,
+    pub dotproduct_left_evals: Vec<EF>,
+    pub dotproduct_right_evals: Vec<EF>,
+    pub dotproduct_weight_evals: Vec<EF>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompactSparkBatchedProductProof<EF> {
+    pub product_roots: Vec<EF>,
+    pub dotproduct_claims: Vec<EF>,
+    pub layers: Vec<CompactSparkProductLayerProof<EF>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CompactSparkProductHeader<EF> {
+    Explicit {
+        products: SparkMemoryProductProof<EF>,
+        matrix_evals: [EF; 3],
+    },
+    Derived,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompactSparkBatchedMemoryProductsProof<EF> {
+    pub header: CompactSparkProductHeader<EF>,
+    pub proof_ops: CompactSparkBatchedProductProof<EF>,
+    pub proof_mem: CompactSparkBatchedProductProof<EF>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SparkBatchedMemoryProductsLeafClaims<EF> {
     pub beta: EF,
@@ -2094,6 +2138,525 @@ where
         ops: ops_claims,
         mem: mem_claims,
     })
+}
+
+/// Encode product rounds without changing their mathematical proof or transcript.
+///
+/// `challenger` must be a copy of the transcript immediately before the memory
+/// metadata is observed by the ordinary SPARK product prover. This performs
+/// scalar transcript replay; it does not rebuild product trees or table values.
+pub fn compress_spark_memory_products<EF, C>(
+    proof: &SparkBatchedMemoryProductsProof<EF>,
+    metadata: &SparkTableMetadata,
+    challenger: &mut C,
+) -> Result<CompactSparkBatchedMemoryProductsProof<EF>, SpartanWhirError>
+where
+    EF: ExtensionField<F>,
+    C: FieldChallenger<F>,
+{
+    replay_compact_spark_memory_context(metadata, Some(&proof.products), challenger)?;
+    validate_compact_spark_roots(
+        &proof.products,
+        &proof.matrix_evals,
+        &proof.proof_ops.product_roots,
+        &proof.proof_mem.product_roots,
+        &proof.proof_ops.dotproduct_claims,
+    )?;
+    let proof_ops =
+        compress_spark_product(&proof.proof_ops, metadata.value_domain_size, 6, challenger)?;
+    let proof_mem = compress_spark_product(
+        &proof.proof_mem,
+        metadata.row_memory_size.max(metadata.col_memory_size),
+        0,
+        challenger,
+    )?;
+    Ok(CompactSparkBatchedMemoryProductsProof {
+        header: CompactSparkProductHeader::Explicit {
+            products: proof.products.clone(),
+            matrix_evals: proof.matrix_evals,
+        },
+        proof_ops,
+        proof_mem,
+    })
+}
+
+/// Omit redundant header values and repeated row/column read evaluations.
+///
+/// This refines an already compressed proof without replaying its transcript.
+/// The decoder derives the header from the original transcript and tree roots,
+/// and expands the two read evaluations back to the six original observations.
+pub fn refine_spark_memory_products<EF: Field>(
+    proof: &mut CompactSparkBatchedMemoryProductsProof<EF>,
+) -> Result<(), SpartanWhirError> {
+    let CompactSparkProductHeader::Explicit {
+        products,
+        matrix_evals,
+    } = &proof.header
+    else {
+        validate_refined_spark_leaf(proof)?;
+        return Ok(());
+    };
+    validate_compact_spark_roots(
+        products,
+        matrix_evals,
+        &proof.proof_ops.product_roots,
+        &proof.proof_mem.product_roots,
+        &proof.proof_ops.dotproduct_claims,
+    )?;
+    let leaf = proof
+        .proof_ops
+        .layers
+        .last_mut()
+        .ok_or(SpartanWhirError::InvalidRoundCount)?;
+    for values in [&leaf.dotproduct_left_evals, &leaf.dotproduct_right_evals] {
+        if values.len() != 6 || values[2..4] != values[..2] || values[4..6] != values[..2] {
+            return Err(SpartanWhirError::InvalidProofShape);
+        }
+    }
+    if !matches!(leaf.rounds, CompactSparkProductRounds::Cubic(_))
+        || leaf.dotproduct_weight_evals.len() != 6
+    {
+        return Err(SpartanWhirError::InvalidProofShape);
+    }
+    leaf.dotproduct_left_evals.truncate(2);
+    leaf.dotproduct_right_evals.truncate(2);
+    proof.header = CompactSparkProductHeader::Derived;
+    Ok(())
+}
+
+fn validate_refined_spark_leaf<EF>(
+    proof: &CompactSparkBatchedMemoryProductsProof<EF>,
+) -> Result<(), SpartanWhirError> {
+    let leaf = proof
+        .proof_ops
+        .layers
+        .last()
+        .ok_or(SpartanWhirError::InvalidRoundCount)?;
+    if proof.proof_ops.product_roots.len() != 4
+        || proof.proof_mem.product_roots.len() != 4
+        || proof.proof_ops.dotproduct_claims.len() != 6
+        || !matches!(leaf.rounds, CompactSparkProductRounds::Cubic(_))
+        || leaf.dotproduct_left_evals.len() != 2
+        || leaf.dotproduct_right_evals.len() != 2
+        || leaf.dotproduct_weight_evals.len() != 6
+    {
+        return Err(SpartanWhirError::InvalidProofShape);
+    }
+    Ok(())
+}
+
+impl<EF> CompactSparkBatchedMemoryProductsProof<EF> {
+    pub fn omits_derived_fields(&self) -> bool {
+        matches!(self.header, CompactSparkProductHeader::Derived)
+    }
+}
+
+/// Restore the ordinary proof and replay its original transcript observations.
+///
+/// The input transcript position matches [`compress_spark_memory_products`].
+/// The returned proof still requires the ordinary SPARK verifier; decoding is
+/// not a substitute for checking the product identities or committed openings.
+pub fn decompress_spark_memory_products<EF, C>(
+    proof: &CompactSparkBatchedMemoryProductsProof<EF>,
+    metadata: &SparkTableMetadata,
+    challenger: &mut C,
+) -> Result<SparkBatchedMemoryProductsProof<EF>, SpartanWhirError>
+where
+    EF: ExtensionField<F>,
+    C: FieldChallenger<F>,
+{
+    let explicit_products = match &proof.header {
+        CompactSparkProductHeader::Explicit { products, .. } => Some(products),
+        CompactSparkProductHeader::Derived => None,
+    };
+    let (beta, gamma) =
+        replay_compact_spark_memory_context(metadata, explicit_products, challenger)?;
+    let (products, matrix_evals) = match &proof.header {
+        CompactSparkProductHeader::Explicit {
+            products,
+            matrix_evals,
+        } => (products.clone(), *matrix_evals),
+        CompactSparkProductHeader::Derived => {
+            validate_refined_spark_leaf(proof)?;
+            let ops = &proof.proof_ops.product_roots;
+            let mem = &proof.proof_mem.product_roots;
+            (
+                SparkMemoryProductProof {
+                    beta,
+                    gamma,
+                    row: SparkMemoryProductClaim {
+                        init_root: mem[0],
+                        read_root: ops[0],
+                        write_root: ops[1],
+                        audit_root: mem[1],
+                    },
+                    col: SparkMemoryProductClaim {
+                        init_root: mem[2],
+                        read_root: ops[2],
+                        write_root: ops[3],
+                        audit_root: mem[3],
+                    },
+                },
+                matrix_evals_from_split_dotproduct_claims(&proof.proof_ops.dotproduct_claims)?,
+            )
+        }
+    };
+    validate_compact_spark_roots(
+        &products,
+        &matrix_evals,
+        &proof.proof_ops.product_roots,
+        &proof.proof_mem.product_roots,
+        &proof.proof_ops.dotproduct_claims,
+    )?;
+    let proof_ops = decompress_spark_product(
+        &proof.proof_ops,
+        metadata.value_domain_size,
+        6,
+        proof.omits_derived_fields(),
+        challenger,
+    )?;
+    let proof_mem = decompress_spark_product(
+        &proof.proof_mem,
+        metadata.row_memory_size.max(metadata.col_memory_size),
+        0,
+        false,
+        challenger,
+    )?;
+    Ok(SparkBatchedMemoryProductsProof {
+        products,
+        matrix_evals,
+        proof_ops,
+        proof_mem,
+    })
+}
+
+fn replay_compact_spark_memory_context<EF, C>(
+    metadata: &SparkTableMetadata,
+    products: Option<&SparkMemoryProductProof<EF>>,
+    challenger: &mut C,
+) -> Result<(EF, EF), SpartanWhirError>
+where
+    EF: ExtensionField<F>,
+    C: FieldChallenger<F>,
+{
+    metadata.validate()?;
+    observe_spark_memory_metadata::<EF, C>(metadata, challenger)?;
+    let beta = challenger.sample_algebra_element::<EF>();
+    let gamma = challenger.sample_algebra_element::<EF>();
+    if products.is_some_and(|products| products.beta != beta || products.gamma != gamma) {
+        return Err(SpartanWhirError::TranscriptMismatch);
+    }
+    Ok((beta, gamma))
+}
+
+fn validate_compact_spark_roots<EF: Field>(
+    products: &SparkMemoryProductProof<EF>,
+    matrix_evals: &[EF; 3],
+    ops_roots: &[EF],
+    mem_roots: &[EF],
+    dotproduct_claims: &[EF],
+) -> Result<(), SpartanWhirError> {
+    if ops_roots
+        != [
+            products.row.read_root,
+            products.row.write_root,
+            products.col.read_root,
+            products.col.write_root,
+        ]
+        || mem_roots
+            != [
+                products.row.init_root,
+                products.row.audit_root,
+                products.col.init_root,
+                products.col.audit_root,
+            ]
+        || *matrix_evals != matrix_evals_from_split_dotproduct_claims(dotproduct_claims)?
+    {
+        return Err(SpartanWhirError::SumcheckFailed);
+    }
+    Ok(())
+}
+
+fn compact_spark_layer_claim<EF, C>(
+    claims: &mut Vec<EF>,
+    leaf_dotproducts: &[EF],
+    challenger: &mut C,
+) -> EF
+where
+    EF: ExtensionField<F>,
+    C: FieldChallenger<F>,
+{
+    claims.extend_from_slice(leaf_dotproducts);
+    let coeffs = sample_batched_product_coefficients(claims, challenger);
+    let claim = claims
+        .iter()
+        .zip(coeffs)
+        .fold(EF::ZERO, |sum, (&value, coeff)| sum + value * coeff);
+    observe_sumcheck_claim::<F, EF, C>(challenger, claim);
+    claim
+}
+
+fn compact_spark_next_layer<EF, C>(
+    layer: &SparkBatchedProductLayerProof<EF>,
+    alpha: Vec<EF>,
+    challenger: &mut C,
+) -> (Vec<EF>, Vec<EF>)
+where
+    EF: ExtensionField<F>,
+    C: FieldChallenger<F>,
+{
+    let combine = observe_batched_product_layer_and_sample(layer, challenger);
+    let claims = layer
+        .product_left_evals
+        .iter()
+        .zip(&layer.product_right_evals)
+        .map(|(&left, &right)| extrapolate(left, right, combine))
+        .collect();
+    let mut point = alpha;
+    point.push(combine);
+    (claims, point)
+}
+
+fn validate_compact_spark_layer<EF>(
+    layer: &SparkBatchedProductLayerProof<EF>,
+    round_count: usize,
+    dotproduct_count: usize,
+) -> Result<(), SpartanWhirError> {
+    if layer.rounds.len() != round_count
+        || layer.product_left_evals.len() != 4
+        || layer.product_right_evals.len() != 4
+        || layer.dotproduct_left_evals.len() != dotproduct_count
+        || layer.dotproduct_right_evals.len() != dotproduct_count
+        || layer.dotproduct_weight_evals.len() != dotproduct_count
+    {
+        return Err(SpartanWhirError::InvalidRoundCount);
+    }
+    Ok(())
+}
+
+fn compress_spark_product<EF, C>(
+    proof: &SparkBatchedProductProof<EF>,
+    domain_size: usize,
+    dotproduct_count: usize,
+    challenger: &mut C,
+) -> Result<CompactSparkBatchedProductProof<EF>, SpartanWhirError>
+where
+    EF: ExtensionField<F>,
+    C: FieldChallenger<F>,
+{
+    let layer_count = log2_power_of_two(domain_size);
+    if proof.layers.len() != layer_count
+        || proof.product_roots.len() != 4
+        || proof.dotproduct_claims.len() != dotproduct_count
+    {
+        return Err(SpartanWhirError::InvalidRoundCount);
+    }
+    let mut claims = proof.product_roots.clone();
+    let mut parent_point = Vec::new();
+    let mut layers = Vec::with_capacity(layer_count);
+    for (index, layer) in proof.layers.iter().enumerate() {
+        let dotproducts = if index + 1 == layer_count {
+            proof.dotproduct_claims.as_slice()
+        } else {
+            &[]
+        };
+        validate_compact_spark_layer(layer, index, dotproducts.len())?;
+        let mut claim = compact_spark_layer_claim(&mut claims, dotproducts, challenger);
+        let mut alpha = Vec::with_capacity(index);
+        let mut factored = Vec::with_capacity(if dotproducts.is_empty() { index } else { 0 });
+        let inverse_slopes = if dotproducts.is_empty() {
+            let slopes = parent_point
+                .iter()
+                .map(|coordinate: &EF| {
+                    let slope = coordinate.double() - EF::ONE;
+                    if slope == EF::ZERO {
+                        EF::ONE
+                    } else {
+                        slope
+                    }
+                })
+                .collect::<Vec<_>>();
+            let mut inverses = vec![EF::ZERO; slopes.len()];
+            p3_field::batch_multiplicative_inverse_general(&slopes, &mut inverses, |x| x.inverse());
+            inverses
+        } else {
+            Vec::new()
+        };
+        for (round_index, round) in layer.rounds.iter().enumerate() {
+            if dotproducts.is_empty() {
+                factored.push(compress_spark_product_round(
+                    round,
+                    claim,
+                    parent_point[round_index],
+                    inverse_slopes[round_index],
+                )?);
+            }
+            challenger.observe_algebra_slice(&round.0);
+            let challenge = challenger.sample_algebra_element::<EF>();
+            claim = evaluate_spark_cubic_for_codec(round, claim, challenge);
+            alpha.push(challenge);
+        }
+        let rounds = if dotproducts.is_empty() {
+            CompactSparkProductRounds::Factored(factored)
+        } else {
+            CompactSparkProductRounds::Cubic(layer.rounds.clone())
+        };
+        layers.push(CompactSparkProductLayerProof {
+            rounds,
+            product_left_evals: layer.product_left_evals.clone(),
+            product_right_evals: layer.product_right_evals.clone(),
+            dotproduct_left_evals: layer.dotproduct_left_evals.clone(),
+            dotproduct_right_evals: layer.dotproduct_right_evals.clone(),
+            dotproduct_weight_evals: layer.dotproduct_weight_evals.clone(),
+        });
+        (claims, parent_point) = compact_spark_next_layer(layer, alpha, challenger);
+    }
+    Ok(CompactSparkBatchedProductProof {
+        product_roots: proof.product_roots.clone(),
+        dotproduct_claims: proof.dotproduct_claims.clone(),
+        layers,
+    })
+}
+
+fn decompress_spark_product<EF, C>(
+    proof: &CompactSparkBatchedProductProof<EF>,
+    domain_size: usize,
+    dotproduct_count: usize,
+    expand_read_pairs: bool,
+    challenger: &mut C,
+) -> Result<SparkBatchedProductProof<EF>, SpartanWhirError>
+where
+    EF: ExtensionField<F>,
+    C: FieldChallenger<F>,
+{
+    let layer_count = log2_power_of_two(domain_size);
+    if proof.layers.len() != layer_count
+        || proof.product_roots.len() != 4
+        || proof.dotproduct_claims.len() != dotproduct_count
+    {
+        return Err(SpartanWhirError::InvalidRoundCount);
+    }
+    let mut claims = proof.product_roots.clone();
+    let mut parent_point = Vec::new();
+    let mut layers = Vec::with_capacity(layer_count);
+    for (index, compact) in proof.layers.iter().enumerate() {
+        let dotproducts = if index + 1 == layer_count {
+            proof.dotproduct_claims.as_slice()
+        } else {
+            &[]
+        };
+        let round_count = match &compact.rounds {
+            CompactSparkProductRounds::Factored(rounds) if dotproducts.is_empty() => rounds.len(),
+            CompactSparkProductRounds::Cubic(rounds) if !dotproducts.is_empty() => rounds.len(),
+            _ => return Err(SpartanWhirError::InvalidRoundPolynomial),
+        };
+        if round_count != index {
+            return Err(SpartanWhirError::InvalidRoundCount);
+        }
+        let mut claim = compact_spark_layer_claim(&mut claims, dotproducts, challenger);
+        let mut alpha = Vec::with_capacity(index);
+        let mut rounds = Vec::with_capacity(index);
+        for round_index in 0..index {
+            let round = match &compact.rounds {
+                CompactSparkProductRounds::Factored(values) => decompress_spark_product_round(
+                    values[round_index],
+                    claim,
+                    parent_point[round_index],
+                ),
+                CompactSparkProductRounds::Cubic(values) => values[round_index].clone(),
+            };
+            challenger.observe_algebra_slice(&round.0);
+            let challenge = challenger.sample_algebra_element::<EF>();
+            claim = evaluate_spark_cubic_for_codec(&round, claim, challenge);
+            alpha.push(challenge);
+            rounds.push(round);
+        }
+        let expand = |values: &[EF]| -> Result<Vec<EF>, SpartanWhirError> {
+            if expand_read_pairs && !dotproducts.is_empty() {
+                let [low, high] = values else {
+                    return Err(SpartanWhirError::InvalidProofShape);
+                };
+                Ok(vec![*low, *high, *low, *high, *low, *high])
+            } else {
+                Ok(values.to_vec())
+            }
+        };
+        let layer = SparkBatchedProductLayerProof {
+            rounds,
+            product_left_evals: compact.product_left_evals.clone(),
+            product_right_evals: compact.product_right_evals.clone(),
+            dotproduct_left_evals: expand(&compact.dotproduct_left_evals)?,
+            dotproduct_right_evals: expand(&compact.dotproduct_right_evals)?,
+            dotproduct_weight_evals: compact.dotproduct_weight_evals.clone(),
+        };
+        validate_compact_spark_layer(&layer, index, dotproducts.len())?;
+        (claims, parent_point) = compact_spark_next_layer(&layer, alpha, challenger);
+        layers.push(layer);
+    }
+    Ok(SparkBatchedProductProof {
+        product_roots: proof.product_roots.clone(),
+        dotproduct_claims: proof.dotproduct_claims.clone(),
+        layers,
+    })
+}
+
+fn spark_cubic_differences<EF: Field>(round: &CubicRoundPoly<EF>, claim: EF) -> [EF; 3] {
+    let [h0, h2, h3] = round.0;
+    let h1 = claim - h0;
+    let first = h1 - h0;
+    let second = h2 - h1.double() + h0;
+    let third = h3 - h2 * EF::from_u32(3) + h1 * EF::from_u32(3) - h0;
+    [first, second, third]
+}
+
+fn evaluate_spark_cubic_for_codec<EF: ExtensionField<F>>(
+    round: &CubicRoundPoly<EF>,
+    claim: EF,
+    challenge: EF,
+) -> EF {
+    let [first, second, third] = spark_cubic_differences(round, claim);
+    let half = F::TWO.inverse();
+    let sixth = F::from_u32(6).inverse();
+    round.0[0]
+        + challenge
+            * (first
+                + (challenge - EF::ONE) * (second * half + (challenge - EF::TWO) * third * sixth))
+}
+
+fn compress_spark_product_round<EF: ExtensionField<F>>(
+    round: &CubicRoundPoly<EF>,
+    claim: EF,
+    equality_coordinate: EF,
+    inverse_slope: EF,
+) -> Result<[EF; 2], SpartanWhirError> {
+    let [first, second, third] = spark_cubic_differences(round, claim);
+    let slope = equality_coordinate.double() - EF::ONE;
+    let values = if slope == EF::ZERO {
+        // E(t) = 1/2, so Q(t) = 2g(t). Reconstruction below also rejects
+        // an input cubic with a nonzero third difference.
+        [first.double() - second, second]
+    } else {
+        let q2 = third * F::from_u32(6).inverse() * inverse_slope;
+        let quadratic = (second - third) * F::TWO.inverse();
+        let q1 = (quadratic - (EF::ONE - equality_coordinate) * q2) * inverse_slope;
+        [q1, q2]
+    };
+    if decompress_spark_product_round(values, claim, equality_coordinate) != *round {
+        return Err(SpartanWhirError::InvalidRoundPolynomial);
+    }
+    Ok(values)
+}
+
+fn decompress_spark_product_round<EF: Field>(
+    [q1, q2]: [EF; 2],
+    claim: EF,
+    equality_coordinate: EF,
+) -> CubicRoundPoly<EF> {
+    let q0 = claim - equality_coordinate * (q1 + q2);
+    let constant = EF::ONE - equality_coordinate;
+    let slope = equality_coordinate.double() - EF::ONE;
+    let evaluate = |t| (constant + slope * t) * (q0 + t * (q1 + t * q2));
+    CubicRoundPoly([constant * q0, evaluate(EF::TWO), evaluate(EF::from_u32(3))])
 }
 
 pub fn prove_spark_grand_product<EF, C>(
@@ -5238,6 +5801,7 @@ fn ratio_ppm(num: usize, den: usize) -> u64 {
 mod tests {
     use super::*;
     use crate::{OcticBinExtension, SparseMatEntry};
+    use p3_challenger::CanObserve;
     use p3_field::{BasedVectorSpace, PrimeCharacteristicRing};
 
     fn entry(row: usize, col: usize, val: u32) -> SparseMatEntry<F> {
@@ -5308,6 +5872,263 @@ mod tests {
                 entries: c,
             },
         }
+    }
+
+    #[test]
+    fn compact_product_rounds_cover_equality_factor_edge_cases() {
+        type EF = crate::QuinticExtension;
+        let q1 = EF::from_basis_coefficients_fn(|i| F::from_u32(7 + 11 * i as u32));
+        let q2 = EF::from_basis_coefficients_fn(|i| F::from_u32(13 + 5 * i as u32));
+        let claim = EF::from_basis_coefficients_fn(|i| F::from_u32(19 + 3 * i as u32));
+        let generic = EF::from_basis_coefficients_fn(|i| F::from_u32(23 + 17 * i as u32));
+        for coordinate in [EF::ZERO, EF::ONE, EF::TWO.inverse(), generic] {
+            let slope = coordinate.double() - EF::ONE;
+            let inverse_slope = if slope == EF::ZERO {
+                EF::ONE
+            } else {
+                slope.inverse()
+            };
+            let round = decompress_spark_product_round([q1, q2], claim, coordinate);
+            assert_eq!(
+                compress_spark_product_round(&round, claim, coordinate, inverse_slope),
+                Ok([q1, q2])
+            );
+            for point in [EF::ZERO, EF::ONE, EF::TWO, generic] {
+                assert_eq!(
+                    evaluate_spark_cubic_for_codec(&round, claim, point),
+                    round.evaluate_at(point, claim)
+                );
+            }
+            let mut malformed = round.clone();
+            malformed.0[0] += EF::ONE;
+            assert_eq!(
+                compress_spark_product_round(&malformed, claim, coordinate, inverse_slope),
+                Err(SpartanWhirError::InvalidRoundPolynomial)
+            );
+        }
+    }
+
+    #[test]
+    fn compact_memory_products_restore_proof_and_transcript() {
+        type EF = crate::QuinticExtension;
+        let shape = shape_with_entries(
+            16,
+            16,
+            (0..16).map(|i| entry(i, i, i as u32 + 1)).collect(),
+            (0..16)
+                .map(|i| entry(i, (i + 1) % 16, i as u32 + 3))
+                .collect(),
+            (0..16)
+                .map(|i| entry(i, (i + 2) % 16, i as u32 + 7))
+                .collect(),
+        );
+        let tables = preprocess_shared_union_spark_tables(&shape).expect("tables");
+        let metadata = tables.metadata();
+        let point = |size: usize, offset: u32| {
+            MultilinearPoint(
+                (0..size.ilog2())
+                    .map(|i| {
+                        EF::from_basis_coefficients_fn(|j| {
+                            F::from_u32(offset + i * 11 + j as u32 * 7)
+                        })
+                    })
+                    .collect(),
+            )
+        };
+        let r_x = point(tables.row_memory_size, 17);
+        let r_y = point(tables.col_memory_size, 31);
+        let mut initial = crate::poseidon1_challenger();
+        initial.observe(F::from_u32(123));
+        let mut prover = initial.clone().with_trace();
+        let proof =
+            prove_spark_batched_memory_products(&tables, &r_x, &r_y, &mut prover).expect("proof");
+        let mut encoder = initial.clone().with_trace();
+        let compact =
+            compress_spark_memory_products(&proof, &metadata, &mut encoder).expect("compress");
+        let mut decoder = initial.clone().with_trace();
+        let restored = decompress_spark_memory_products(&compact, &metadata, &mut decoder)
+            .expect("decompress");
+        assert_eq!(restored, proof);
+        assert_eq!(encoder.transcript_trace(), prover.transcript_trace());
+        assert_eq!(decoder.transcript_trace(), prover.transcript_trace());
+        let next = prover.sample_algebra_element::<EF>();
+        assert_eq!(encoder.sample_algebra_element::<EF>(), next);
+        assert_eq!(decoder.sample_algebra_element::<EF>(), next);
+        let mut verifier = initial.clone().with_trace();
+        verify_spark_batched_memory_products_with_tables(
+            &tables,
+            &restored,
+            &r_x,
+            &r_y,
+            &mut verifier,
+        )
+        .expect("restored proof verifies");
+        assert_eq!(verifier.sample_algebra_element::<EF>(), next);
+        assert_eq!(verifier.transcript_trace(), prover.transcript_trace());
+
+        let pure_rounds = compact
+            .proof_ops
+            .layers
+            .iter()
+            .chain(&compact.proof_mem.layers)
+            .map(|layer| match &layer.rounds {
+                CompactSparkProductRounds::Factored(rounds) => rounds.len(),
+                CompactSparkProductRounds::Cubic(_) => 0,
+            })
+            .sum::<usize>();
+        let expected_saving = pure_rounds * <EF as BasedVectorSpace<F>>::DIMENSION * 4
+            - 4 * (proof.proof_ops.layers.len() + proof.proof_mem.layers.len())
+            - 4;
+        assert_eq!(
+            bincode::serialize(&proof)
+                .expect("serialize ordinary")
+                .len()
+                - bincode::serialize(&compact)
+                    .expect("serialize compact")
+                    .len(),
+            expected_saving
+        );
+
+        let mut refined = compact.clone();
+        refine_spark_memory_products(&mut refined).expect("refine");
+        assert!(refined.omits_derived_fields());
+        let compact_bytes = bincode::serialize(&compact).expect("compact bytes");
+        let refined_bytes = bincode::serialize(&refined).expect("refined bytes");
+        assert_eq!(
+            compact_bytes.len() - refined_bytes.len(),
+            21 * <EF as BasedVectorSpace<F>>::DIMENSION * 4
+        );
+        let mut refined: CompactSparkBatchedMemoryProductsProof<EF> =
+            bincode::deserialize(&refined_bytes).expect("deserialize refined");
+        refine_spark_memory_products(&mut refined).expect("idempotent refinement");
+        assert_eq!(
+            bincode::serialize(&refined).expect("serialize"),
+            refined_bytes
+        );
+        let mut refined_decoder = initial.clone().with_trace();
+        let refined_restored =
+            decompress_spark_memory_products(&refined, &metadata, &mut refined_decoder)
+                .expect("restore refined");
+        assert_eq!(refined_restored, proof);
+        assert_eq!(refined_decoder.sample_algebra_element::<EF>(), next);
+        assert_eq!(
+            refined_decoder.transcript_trace(),
+            prover.transcript_trace()
+        );
+        verify_spark_batched_memory_products_with_tables(
+            &tables,
+            &refined_restored,
+            &r_x,
+            &r_y,
+            &mut initial.clone(),
+        )
+        .expect("refined proof verifies");
+
+        let mut bad_pair = compact.clone();
+        bad_pair
+            .proof_ops
+            .layers
+            .last_mut()
+            .expect("leaf")
+            .dotproduct_left_evals[2] += EF::ONE;
+        let unchanged = bad_pair.clone();
+        assert!(refine_spark_memory_products(&mut bad_pair).is_err());
+        assert_eq!(bad_pair, unchanged);
+        let mut malformed_refined = refined.clone();
+        malformed_refined
+            .proof_ops
+            .layers
+            .last_mut()
+            .expect("leaf")
+            .dotproduct_right_evals
+            .push(EF::ZERO);
+        assert!(decompress_spark_memory_products(
+            &malformed_refined,
+            &metadata,
+            &mut initial.clone(),
+        )
+        .is_err());
+        let mut altered_refined = refined.clone();
+        altered_refined
+            .proof_ops
+            .layers
+            .last_mut()
+            .expect("leaf")
+            .dotproduct_left_evals[0] += EF::ONE;
+        let altered_restored =
+            decompress_spark_memory_products(&altered_refined, &metadata, &mut initial.clone())
+                .expect("decode altered pair");
+        assert!(verify_spark_batched_memory_products_with_tables(
+            &tables,
+            &altered_restored,
+            &r_x,
+            &r_y,
+            &mut initial.clone(),
+        )
+        .is_err());
+
+        let mut changed = compact.clone();
+        let CompactSparkProductRounds::Factored(rounds) = &mut changed.proof_ops.layers[1].rounds
+        else {
+            panic!("internal product layer is factored");
+        };
+        rounds[0][0] += EF::ONE;
+        let changed = decompress_spark_memory_products(&changed, &metadata, &mut initial.clone())
+            .expect("coefficient mutation decodes to a different proof");
+        assert_ne!(changed, proof);
+        assert!(verify_spark_batched_memory_products_with_tables(
+            &tables,
+            &changed,
+            &r_x,
+            &r_y,
+            &mut initial.clone(),
+        )
+        .is_err());
+
+        let mut wrong_kind = compact.clone();
+        wrong_kind.proof_ops.layers.last_mut().expect("leaf").rounds =
+            CompactSparkProductRounds::Factored(vec![
+                [EF::ZERO; 2];
+                proof.proof_ops.layers.len() - 1
+            ]);
+        assert!(
+            decompress_spark_memory_products(&wrong_kind, &metadata, &mut initial.clone(),)
+                .is_err()
+        );
+        let mut wrong_count = compact.clone();
+        wrong_count.proof_mem.layers.pop();
+        assert!(
+            decompress_spark_memory_products(&wrong_count, &metadata, &mut initial.clone(),)
+                .is_err()
+        );
+        let mut wrong_context = metadata;
+        wrong_context.layout = SparkLayoutKind::Joint;
+        assert!(
+            decompress_spark_memory_products(&compact, &wrong_context, &mut initial.clone(),)
+                .is_err()
+        );
+        // The refined header has no challenge copies to compare. A different
+        // transcript context must still fail ordinary proof verification.
+        let wrong_context_proof =
+            decompress_spark_memory_products(&refined, &wrong_context, &mut initial.clone())
+                .expect("decode under another structurally valid context");
+        assert!(verify_spark_batched_memory_product_claims_with_metadata(
+            &wrong_context,
+            &wrong_context_proof,
+            &mut initial.clone(),
+        )
+        .is_err());
+        let mut wrong_root = refined;
+        wrong_root.proof_ops.product_roots[0] += EF::ONE;
+        let wrong_root_proof =
+            decompress_spark_memory_products(&wrong_root, &metadata, &mut initial.clone())
+                .expect("decode altered tree root");
+        assert!(verify_spark_batched_memory_product_claims_with_metadata(
+            &metadata,
+            &wrong_root_proof,
+            &mut initial.clone(),
+        )
+        .is_err());
     }
 
     #[test]

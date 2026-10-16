@@ -2,11 +2,11 @@ error[E0308]: mismatched types
  --> tests/ui/zk_vk_rejects_no_zk_proof.rs:9:28
   |
 9 |     let _ = vk.verify(&[], proof);
-  |                ------      ^^^^^ expected `&PoseidonZkProof<ExtField<..., 4, ...>>`, found `&PoseidonProof<ExtField<..., 4, ...>>`
+  |                ------      ^^^^^ expected `&PoseidonZkProofFor<PoseidonEngine<...>>`, found `&PoseidonProof<ExtField<..., 4, ...>>`
   |                |
   |                arguments to this method are incorrect
   |
-  = note: expected reference `&PoseidonZkProof<p3_field::extension::ExtField<p3_monty_31::monty_31::MontyField31<p3_koala_bear::koala_bear::KoalaBearParameters>, 4, p3_field::extension::Binomial<p3_monty_31::monty_31::MontyField31<p3_koala_bear::koala_bear::KoalaBearParameters>>>>`
+  = note: expected reference `&PoseidonZkProofFor<PoseidonEngine<p3_field::extension::ExtField<p3_monty_31::monty_31::MontyField31<p3_koala_bear::koala_bear::KoalaBearParameters>, 4, p3_field::extension::Binomial<p3_monty_31::monty_31::MontyField31<p3_koala_bear::koala_bear::KoalaBearParameters>>>>>`
              found reference `&PoseidonProof<p3_field::extension::ExtField<p3_monty_31::monty_31::MontyField31<p3_koala_bear::koala_bear::KoalaBearParameters>, 4, p3_field::extension::Binomial<p3_monty_31::monty_31::MontyField31<p3_koala_bear::koala_bear::KoalaBearParameters>>>>`
 note: method defined here
  --> src/poseidon.rs

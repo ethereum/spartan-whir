@@ -9,17 +9,31 @@ use std::{
 use libloading::Library;
 use p3_challenger::{CanObserve, CanSampleUniformBits, FieldChallenger, GrindingChallenger};
 use p3_field::TwoAdicField;
+use p3_maybe_rayon::prelude::current_num_threads;
 use rand::distr::{Distribution, StandardUniform};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use spartan_whir::{
     engine::{ExtField, F},
-    import_paths, import_r1cs_path, setup_poseidon_zk, validate_satisfaction,
-    LinkedWitnessFreeCircuitFn, LinkedWitnessGeneratorFn, LinkedWitnessLoadCircuitFn, MlePcs,
-    Plonky3WhirPcs, PoseidonChallenger, PoseidonEngine, PoseidonProvingKey, PoseidonSetupConfig,
-    PoseidonSpartanProtocol, PoseidonVerifyingKey, PoseidonWitnessGenerator, PoseidonZkProvingKey,
-    PoseidonZkSetupConfig, PoseidonZkVerifyingKey, QuarticBinExtension, R1csShape, R1csWitness,
+    import_paths, import_r1cs_path, validate_satisfaction, LinkedWitnessFreeCircuitFn,
+    LinkedWitnessGeneratorFn, LinkedWitnessLoadCircuitFn, MlePcs, Plonky3WhirPcs,
+    PoseidonSetupConfig, PoseidonWitnessGenerator, PoseidonZkSetupConfig, QuarticBinExtension,
+    R1csShape, R1csWitness,
+};
+
+#[cfg(feature = "poseidon1")]
+use spartan_whir::{
+    poseidon1_challenger as poseidon_challenger, setup_poseidon1_zk as setup_poseidon_zk,
+    Poseidon1Challenger as PoseidonChallenger, Poseidon1Engine as PoseidonEngine,
+    Poseidon1ProvingKey as PoseidonProvingKey, Poseidon1SpartanProtocol as PoseidonSpartanProtocol,
+    Poseidon1VerifyingKey as PoseidonVerifyingKey, Poseidon1ZkProvingKey as PoseidonZkProvingKey,
+    Poseidon1ZkVerifyingKey as PoseidonZkVerifyingKey,
+};
+#[cfg(not(feature = "poseidon1"))]
+use spartan_whir::{
+    poseidon_challenger, setup_poseidon_zk, PoseidonChallenger, PoseidonEngine, PoseidonProvingKey,
+    PoseidonSpartanProtocol, PoseidonVerifyingKey, PoseidonZkProvingKey, PoseidonZkVerifyingKey,
 };
 
 mod poseidon_schedule_support;
@@ -90,6 +104,9 @@ struct HeldoutDump {
     #[serde(flatten)]
     selection: RowSelectionMetadata,
     proof_mode: &'static str,
+    hash_profile: &'static str,
+    rayon_threads: usize,
+    verifier_measurement: &'static str,
     interleaved_repeats: bool,
     randomize_linked_input_bits: bool,
     rows: Vec<Value>,
@@ -159,7 +176,7 @@ fn run_main() -> Result<(), String> {
     let measured = measure_rows(&shape, &input_source, rows, &args)?;
 
     let dump = HeldoutDump {
-        schema_version: 4,
+        schema_version: 5,
         provenance,
         workload_identity,
         measurement_kind: "poseidon_schedule_full_proof_heldout",
@@ -175,6 +192,14 @@ fn run_main() -> Result<(), String> {
         warmups: args.warmups,
         selection,
         proof_mode: args.proof_mode.name(),
+        hash_profile: if cfg!(feature = "poseidon1") {
+            "poseidon1"
+        } else {
+            "poseidon2"
+        },
+        rayon_threads: current_num_threads(),
+        verifier_measurement:
+            "native wall time; use RAYON_NUM_THREADS=1 as the sequential recursive-verifier proxy",
         interleaved_repeats: measured.interleaved_repeats,
         randomize_linked_input_bits: args.randomize_linked_input_bits,
         rows: measured.rows,
@@ -393,6 +418,10 @@ struct Measurement {
     mean_seconds: f64,
     median_ci_seconds: (f64, f64),
     samples_seconds: Vec<f64>,
+    verifier_median_seconds: f64,
+    verifier_mean_seconds: f64,
+    verifier_median_ci_seconds: (f64, f64),
+    verifier_samples_seconds: Vec<f64>,
     proof_size_min_bytes: usize,
     proof_size_median_bytes: usize,
     proof_size_max_bytes: usize,
@@ -470,7 +499,7 @@ impl PreparedFullZkRowAny {
         &self,
         witness: &R1csWitness<F>,
         public_inputs: &[F],
-    ) -> Result<(f64, usize), String> {
+    ) -> Result<(f64, f64, usize), String> {
         match self {
             Self::Quartic(row) => prove_timed(row, witness, public_inputs),
             Self::Quintic(row) => prove_timed(row, witness, public_inputs),
@@ -538,7 +567,7 @@ impl PreparedNoZkRowAny {
         &self,
         witness: &R1csWitness<F>,
         public_inputs: &[F],
-    ) -> Result<(f64, usize), String> {
+    ) -> Result<(f64, f64, usize), String> {
         match self {
             Self::Quartic(row) => prove_no_zk_timed(row, witness, public_inputs),
             Self::Quintic(row) => prove_no_zk_timed(row, witness, public_inputs),
@@ -678,12 +707,15 @@ fn measure_no_zk_rows_interleaved(
     let interleaved_repeats =
         orders_cover_each_row_once(&repeat_orders, prepared.len(), args.repeats);
     let mut samples = vec![Vec::with_capacity(args.repeats); prepared.len()];
+    let mut verifier_samples = vec![Vec::with_capacity(args.repeats); prepared.len()];
     let mut proof_sizes = vec![Vec::with_capacity(args.repeats); prepared.len()];
     for (repeat, order) in repeat_orders.into_iter().enumerate() {
         let (witness, public_inputs) = input_source.sample(shape, repeat)?;
         for index in order {
-            let (elapsed, proof_size) = prepared[index].prove_timed(&witness, &public_inputs)?;
+            let (elapsed, verifier_elapsed, proof_size) =
+                prepared[index].prove_timed(&witness, &public_inputs)?;
             samples[index].push(elapsed);
+            verifier_samples[index].push(verifier_elapsed);
             proof_sizes[index].push(proof_size);
         }
     }
@@ -692,7 +724,11 @@ fn measure_no_zk_rows_interleaved(
         let original_index = prepared_row.original_index();
         let label = prepared_row.label().to_owned();
         let row = prepared_row.into_row();
-        let measurement = summarize_samples(&samples[prepared_index], &proof_sizes[prepared_index]);
+        let measurement = summarize_samples(
+            &samples[prepared_index],
+            &verifier_samples[prepared_index],
+            &proof_sizes[prepared_index],
+        );
         measured[original_index] =
             measured_row(shape, row, &label, measurement, args, interleaved_repeats)?;
     }
@@ -741,7 +777,7 @@ where
         + FieldChallenger<F>
         + GrindingChallenger<Witness = F>,
 {
-    let mut prover_challenger = spartan_whir::poseidon_challenger();
+    let mut prover_challenger = poseidon_challenger();
     let (instance, proof) = PoseidonSpartanProtocol::<Ext>::prove_with_mode(
         &row.pk,
         public_inputs,
@@ -750,7 +786,7 @@ where
         &mut prover_challenger,
     )
     .map_err(|err| format!("{}: {phase} no-ZK failed: {err:?}", row.label))?;
-    let mut verifier_challenger = spartan_whir::poseidon_challenger();
+    let mut verifier_challenger = poseidon_challenger();
     PoseidonSpartanProtocol::<Ext>::verify_with_mode(
         &row.vk,
         &instance,
@@ -764,7 +800,7 @@ fn prove_no_zk_timed<Ext>(
     row: &PreparedNoZkRow<Ext>,
     witness: &R1csWitness<F>,
     public_inputs: &[F],
-) -> Result<(f64, usize), String>
+) -> Result<(f64, f64, usize), String>
 where
     Ext: ExtField + TwoAdicField,
     PoseidonChallenger: CanObserve<<Plonky3WhirPcs as MlePcs<PoseidonEngine<Ext>>>::Commitment>
@@ -772,7 +808,7 @@ where
         + FieldChallenger<F>
         + GrindingChallenger<Witness = F>,
 {
-    let mut prover_challenger = spartan_whir::poseidon_challenger();
+    let mut prover_challenger = poseidon_challenger();
     let start = Instant::now();
     let (instance, proof) = PoseidonSpartanProtocol::<Ext>::prove_with_mode(
         &row.pk,
@@ -786,7 +822,8 @@ where
     let proof_size = bincode::serialize(&proof)
         .map_err(|err| format!("{}: no-ZK proof serialization failed: {err}", row.label))?
         .len();
-    let mut verifier_challenger = spartan_whir::poseidon_challenger();
+    let mut verifier_challenger = poseidon_challenger();
+    let verify_start = Instant::now();
     PoseidonSpartanProtocol::<Ext>::verify_with_mode(
         &row.vk,
         &instance,
@@ -794,7 +831,8 @@ where
         &mut verifier_challenger,
     )
     .map_err(|err| format!("{}: no-ZK verify failed: {err:?}", row.label))?;
-    Ok((elapsed, proof_size))
+    let verifier_elapsed = verify_start.elapsed().as_secs_f64();
+    Ok((elapsed, verifier_elapsed, proof_size))
 }
 
 fn measure_full_zk_rows_interleaved(
@@ -840,12 +878,15 @@ fn measure_full_zk_rows_interleaved(
     let interleaved_repeats =
         orders_cover_each_row_once(&repeat_orders, prepared.len(), args.repeats);
     let mut samples = vec![Vec::with_capacity(args.repeats); prepared.len()];
+    let mut verifier_samples = vec![Vec::with_capacity(args.repeats); prepared.len()];
     let mut proof_sizes = vec![Vec::with_capacity(args.repeats); prepared.len()];
     for (repeat, order) in repeat_orders.into_iter().enumerate() {
         let (witness, public_inputs) = input_source.sample(shape, repeat)?;
         for index in order {
-            let (elapsed, proof_size) = prepared[index].prove_timed(&witness, &public_inputs)?;
+            let (elapsed, verifier_elapsed, proof_size) =
+                prepared[index].prove_timed(&witness, &public_inputs)?;
             samples[index].push(elapsed);
+            verifier_samples[index].push(verifier_elapsed);
             proof_sizes[index].push(proof_size);
         }
     }
@@ -854,7 +895,11 @@ fn measure_full_zk_rows_interleaved(
         let original_index = prepared_row.original_index();
         let label = prepared_row.label().to_owned();
         let row = prepared_row.into_row();
-        let measurement = summarize_samples(&samples[prepared_index], &proof_sizes[prepared_index]);
+        let measurement = summarize_samples(
+            &samples[prepared_index],
+            &verifier_samples[prepared_index],
+            &proof_sizes[prepared_index],
+        );
         measured[original_index] =
             measured_row(shape, row, &label, measurement, args, interleaved_repeats)?;
     }
@@ -912,7 +957,7 @@ fn prove_timed<Ext>(
     row: &PreparedFullZkRow<Ext>,
     witness: &R1csWitness<F>,
     public_inputs: &[F],
-) -> Result<(f64, usize), String>
+) -> Result<(f64, f64, usize), String>
 where
     Ext: ExtField,
     StandardUniform: Distribution<Ext>,
@@ -927,10 +972,12 @@ where
     let proof_size = bincode::serialize(&proof.proof)
         .map_err(|err| format!("{}: proof serialization failed: {err}", row.label))?
         .len();
+    let verify_start = Instant::now();
     row.vk
         .verify(&proof.instance.public_inputs, &proof)
         .map_err(|err| format!("{}: verify failed: {err:?}", row.label))?;
-    Ok((elapsed, proof_size))
+    let verifier_elapsed = verify_start.elapsed().as_secs_f64();
+    Ok((elapsed, verifier_elapsed, proof_size))
 }
 
 fn measured_row(
@@ -1010,6 +1057,32 @@ fn measured_row(
         ),
     );
     object.insert(
+        "heldout_verify_seconds".to_owned(),
+        Value::from(measurement.verifier_median_seconds),
+    );
+    object.insert(
+        "heldout_verify_mean_seconds".to_owned(),
+        Value::from(measurement.verifier_mean_seconds),
+    );
+    object.insert(
+        "heldout_verify_median_ci_seconds".to_owned(),
+        Value::Array(vec![
+            Value::from(measurement.verifier_median_ci_seconds.0),
+            Value::from(measurement.verifier_median_ci_seconds.1),
+        ]),
+    );
+    object.insert(
+        "heldout_verify_samples_seconds".to_owned(),
+        Value::Array(
+            measurement
+                .verifier_samples_seconds
+                .iter()
+                .copied()
+                .map(Value::from)
+                .collect(),
+        ),
+    );
+    object.insert(
         "heldout_proof_size_min_bytes".to_owned(),
         Value::from(measurement.proof_size_min_bytes as u64),
     );
@@ -1024,19 +1097,33 @@ fn measured_row(
     Ok(row)
 }
 
-fn summarize_samples(samples: &[f64], proof_sizes: &[usize]) -> Measurement {
+fn summarize_samples(
+    samples: &[f64],
+    verifier_samples: &[f64],
+    proof_sizes: &[usize],
+) -> Measurement {
     assert_eq!(samples.len(), proof_sizes.len());
+    assert_eq!(samples.len(), verifier_samples.len());
     let mut sorted = samples.to_vec();
     sorted.sort_by(f64::total_cmp);
     let mut sorted_sizes = proof_sizes.to_vec();
     sorted_sizes.sort_unstable();
     let median_seconds = sorted[sorted.len() / 2];
     let mean_seconds = samples.iter().sum::<f64>() / samples.len() as f64;
+    let mut sorted_verifier = verifier_samples.to_vec();
+    sorted_verifier.sort_by(f64::total_cmp);
+    let verifier_median_seconds = sorted_verifier[sorted_verifier.len() / 2];
+    let verifier_mean_seconds =
+        verifier_samples.iter().sum::<f64>() / verifier_samples.len() as f64;
     Measurement {
         median_seconds,
         mean_seconds,
         median_ci_seconds: bootstrap_median_ci(samples, 2_000, 0x5eed_5eed),
         samples_seconds: samples.to_vec(),
+        verifier_median_seconds,
+        verifier_mean_seconds,
+        verifier_median_ci_seconds: bootstrap_median_ci(verifier_samples, 2_000, 0x5eed_71f1),
+        verifier_samples_seconds: verifier_samples.to_vec(),
         proof_size_min_bytes: sorted_sizes[0],
         proof_size_median_bytes: sorted_sizes[sorted_sizes.len() / 2],
         proof_size_max_bytes: sorted_sizes[sorted_sizes.len() - 1],
@@ -2415,9 +2502,10 @@ mod tests {
 
     #[test]
     fn sample_summary_records_exact_proof_size_statistics() {
-        let measurement = summarize_samples(&[3.0, 1.0, 2.0], &[120, 100, 110]);
+        let measurement = summarize_samples(&[3.0, 1.0, 2.0], &[0.3, 0.1, 0.2], &[120, 100, 110]);
 
         assert_eq!(measurement.median_seconds, 2.0);
+        assert_eq!(measurement.verifier_median_seconds, 0.2);
         assert_eq!(measurement.proof_size_min_bytes, 100);
         assert_eq!(measurement.proof_size_median_bytes, 110);
         assert_eq!(measurement.proof_size_max_bytes, 120);

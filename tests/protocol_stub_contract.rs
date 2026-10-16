@@ -905,6 +905,25 @@ fn protocol_spark_verifying_key_fixed_commitment_mismatch_fails() {
 }
 
 #[test]
+fn protocol_restored_verifying_key_rejects_relation_change_with_stale_digest() {
+    let shape = regular_shape_two_constraints();
+    let (_, vk) = setup_keys_with_mode(&shape, MatrixClosingMode::DirectSparse);
+
+    let mut encoded = serde_json::to_value(&vk).expect("verifying key serializes");
+    let matrix_value = &mut encoded["shape_canonical"]["a"]["entries"][0]["val"];
+    let value = matrix_value
+        .as_u64()
+        .expect("matrix coefficient is an integer");
+    *matrix_value = serde_json::json!(value + 1);
+    let mut forged: spartan_whir::VerifyingKey<PoseidonEngine, Plonky3WhirPcs> =
+        serde_json::from_value(encoded).expect("changed relation decodes");
+    assert!(matches!(
+        forged.authenticate(),
+        Err(SpartanWhirError::InvalidConfig(_))
+    ));
+}
+
+#[test]
 fn protocol_wrong_public_input_fails() {
     let shape = common::koala_shape_single_constraint(2);
     let (pk, vk) = setup_keys_with_mode(&shape, MatrixClosingMode::DirectSparse);

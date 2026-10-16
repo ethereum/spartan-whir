@@ -69,7 +69,7 @@ pub enum InvalidConfigReason {
     },
     ComposedSecurityBudgetOverflow,
     MissingDerivedProverData,
-    UnauthenticatedSparkVerifyingKey,
+    UnauthenticatedVerifyingKey,
 }
 
 impl core::fmt::Display for InvalidConfigReason {
@@ -162,8 +162,8 @@ impl core::fmt::Display for InvalidConfigReason {
                 write!(f, "composed security budget arithmetic overflowed")
             }
             Self::MissingDerivedProverData => write!(f, "derived prover data is missing"),
-            Self::UnauthenticatedSparkVerifyingKey => {
-                write!(f, "SPARK verifying key commitments are not authenticated")
+            Self::UnauthenticatedVerifyingKey => {
+                write!(f, "verifying key is not authenticated")
             }
         }
     }

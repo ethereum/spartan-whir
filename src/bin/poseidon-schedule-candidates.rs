@@ -11,11 +11,16 @@ use p3_whir::parameters::{
 use serde::Serialize;
 use spartan_whir::plonky3_whir_pcs::hiding_terminal_budget;
 use spartan_whir::{
-    engine::{PoseidonChallenger, F},
-    format_whir_params_label, MatrixClosingMode, OcticBinExtension, PoseidonZkSetupConfig,
-    QuarticBinExtension, SecurityConfig, SoundnessAssumption, SpartanSnarkConfig,
-    WhirFoldingSchedule, WhirParams, FINAL_SUMCHECK_MAX_VARIABLES, MAX_SECURITY_BITS,
+    engine::F, format_whir_params_label, MatrixClosingMode, OcticBinExtension,
+    PoseidonZkSetupConfig, QuarticBinExtension, SecurityConfig, SoundnessAssumption,
+    SpartanSnarkConfig, WhirFoldingSchedule, WhirParams, FINAL_SUMCHECK_MAX_VARIABLES,
+    MAX_SECURITY_BITS,
 };
+
+#[cfg(feature = "poseidon1")]
+use spartan_whir::Poseidon1Challenger as PoseidonChallenger;
+#[cfg(not(feature = "poseidon1"))]
+use spartan_whir::PoseidonChallenger;
 
 mod poseidon_schedule_support;
 use poseidon_schedule_support::{
@@ -137,6 +142,7 @@ struct CandidateDump {
     max_pow_bits: usize,
     round_log_inv_rate_offset_max: usize,
     proof_mode: &'static str,
+    hash_profile: &'static str,
     zk_ell: Option<usize>,
     zk_mask_log_inv_rate: Option<usize>,
     candidates: Vec<CandidateRow>,
@@ -165,12 +171,22 @@ struct CandidateRow {
     merkle_path_work: u128,
     row_work: u128,
     sumcheck_work: u128,
+    verifier_merkle_hashes: u128,
+    verifier_leaf_field_elements: u128,
+    verifier_row_field_elements: u128,
+    verifier_extension_operations: u128,
+    verifier_pow_checks: u128,
     proof_size_bytes_estimate: u128,
     zk_dft_work: Option<u128>,
     zk_merkle_work: Option<u128>,
     zk_merkle_path_work: Option<u128>,
     zk_row_work: Option<u128>,
     zk_sumcheck_work: Option<u128>,
+    zk_verifier_merkle_hashes: Option<u128>,
+    zk_verifier_leaf_field_elements: Option<u128>,
+    zk_verifier_row_field_elements: Option<u128>,
+    zk_verifier_extension_operations: Option<u128>,
+    zk_verifier_pow_checks: Option<u128>,
     zk_proof_size_bytes_estimate: Option<u128>,
     zk_mask_queries: Option<usize>,
     zk_application_mask_domain: Option<usize>,
@@ -280,6 +296,11 @@ fn main() {
         max_pow_bits: args.max_pow_bits,
         round_log_inv_rate_offset_max: args.round_log_inv_rate_offset_max,
         proof_mode: args.proof_mode.label(),
+        hash_profile: if cfg!(feature = "poseidon1") {
+            "poseidon1"
+        } else {
+            "poseidon2"
+        },
         zk_ell: args.proof_mode.is_full_zk().then_some(args.zk_ell),
         zk_mask_log_inv_rate: args
             .proof_mode
@@ -519,6 +540,7 @@ fn derive_for_extension<Base, Ext, Challenger>(
     let merkle_path_work = merkle_path_work::<Base, Ext, Challenger>(&config);
     let row_work = row_work::<Base, Ext, Challenger>(&config);
     let sumcheck_work = sumcheck_work::<Base, Ext, Challenger>(&config);
+    let verifier = verifier_work::<Base, Ext, Challenger>(&config, terminal_pow_bits);
     let plain_proof_size_bytes_estimate =
         proof_size_bytes_estimate::<Base, Ext, Challenger>(&config);
     let zk_estimates = if args.proof_mode.is_full_zk() && zk_rejection.is_none() {
@@ -531,6 +553,7 @@ fn derive_for_extension<Base, Ext, Challenger>(
                 merkle_path_work,
                 row_work,
                 sumcheck_work,
+                verifier,
             },
         ))
     } else {
@@ -578,6 +601,11 @@ fn derive_for_extension<Base, Ext, Challenger>(
         merkle_path_work,
         row_work,
         sumcheck_work,
+        verifier_merkle_hashes: verifier.merkle_hashes,
+        verifier_leaf_field_elements: verifier.leaf_field_elements,
+        verifier_row_field_elements: verifier.row_field_elements,
+        verifier_extension_operations: verifier.extension_operations,
+        verifier_pow_checks: verifier.pow_checks,
         proof_size_bytes_estimate,
         zk_dft_work: zk_estimates.as_ref().map(|estimate| estimate.dft_work),
         zk_merkle_work: zk_estimates.as_ref().map(|estimate| estimate.merkle_work),
@@ -586,6 +614,21 @@ fn derive_for_extension<Base, Ext, Challenger>(
             .map(|estimate| estimate.merkle_path_work),
         zk_row_work: zk_estimates.as_ref().map(|estimate| estimate.row_work),
         zk_sumcheck_work: zk_estimates.as_ref().map(|estimate| estimate.sumcheck_work),
+        zk_verifier_merkle_hashes: zk_estimates
+            .as_ref()
+            .map(|estimate| estimate.verifier.merkle_hashes),
+        zk_verifier_leaf_field_elements: zk_estimates
+            .as_ref()
+            .map(|estimate| estimate.verifier.leaf_field_elements),
+        zk_verifier_row_field_elements: zk_estimates
+            .as_ref()
+            .map(|estimate| estimate.verifier.row_field_elements),
+        zk_verifier_extension_operations: zk_estimates
+            .as_ref()
+            .map(|estimate| estimate.verifier.extension_operations),
+        zk_verifier_pow_checks: zk_estimates
+            .as_ref()
+            .map(|estimate| estimate.verifier.pow_checks),
         zk_proof_size_bytes_estimate: zk_estimates
             .as_ref()
             .map(|estimate| estimate.proof_size_bytes_estimate),
@@ -645,6 +688,7 @@ struct ZkBaseEstimates {
     merkle_path_work: u128,
     row_work: u128,
     sumcheck_work: u128,
+    verifier: VerifierWorkEstimate,
 }
 
 struct ZkEstimates {
@@ -653,6 +697,7 @@ struct ZkEstimates {
     merkle_path_work: u128,
     row_work: u128,
     sumcheck_work: u128,
+    verifier: VerifierWorkEstimate,
     proof_size_bytes_estimate: u128,
     mask_queries: usize,
     application_mask: ApplicationMaskEstimate,
@@ -707,6 +752,14 @@ where
     let sumcheck_work_extra = sumcheck_rounds
         .iter()
         .map(|rounds| (*rounds as u128).saturating_mul(args.zk_ell.max(3) as u128))
+        .fold(0, u128::saturating_add);
+    let verifier_extension_operations_extra = sumcheck_rounds
+        .iter()
+        .map(|rounds| {
+            (*rounds as u128)
+                .saturating_mul(args.zk_ell.max(3) as u128)
+                .saturating_mul(2)
+        })
         .fold(0, u128::saturating_add);
     let application_mask_rows = (application_mask.domain_size as u128)
         .saturating_mul(application_mask.width as u128)
@@ -768,6 +821,32 @@ where
         merkle_path_work: base.merkle_path_work.saturating_add(merkle_path_work_extra),
         row_work: base.row_work.saturating_add(row_work_extra),
         sumcheck_work: base.sumcheck_work.saturating_add(sumcheck_work_extra),
+        verifier: VerifierWorkEstimate {
+            merkle_hashes: base
+                .verifier
+                .merkle_hashes
+                .saturating_add(zk_merkle_multiproof_hashes(
+                    config,
+                    mask_queries,
+                    sumcheck_mask_domain,
+                    &switch_mask_domains,
+                    application_mask,
+                    base_mask_width,
+                )),
+            leaf_field_elements: base
+                .verifier
+                .leaf_field_elements
+                .saturating_add(row_work_extra),
+            row_field_elements: base
+                .verifier
+                .row_field_elements
+                .saturating_add(row_work_extra),
+            extension_operations: base
+                .verifier
+                .extension_operations
+                .saturating_add(verifier_extension_operations_extra),
+            pow_checks: base.verifier.pow_checks,
+        },
         proof_size_bytes_estimate,
         mask_queries,
         application_mask,
@@ -1280,12 +1359,22 @@ fn invalid_row(
         merkle_path_work: 0,
         row_work: 0,
         sumcheck_work: 0,
+        verifier_merkle_hashes: 0,
+        verifier_leaf_field_elements: 0,
+        verifier_row_field_elements: 0,
+        verifier_extension_operations: 0,
+        verifier_pow_checks: 0,
         proof_size_bytes_estimate: 0,
         zk_dft_work: None,
         zk_merkle_work: None,
         zk_merkle_path_work: None,
         zk_row_work: None,
         zk_sumcheck_work: None,
+        zk_verifier_merkle_hashes: None,
+        zk_verifier_leaf_field_elements: None,
+        zk_verifier_row_field_elements: None,
+        zk_verifier_extension_operations: None,
+        zk_verifier_pow_checks: None,
         zk_proof_size_bytes_estimate: None,
         zk_mask_queries: None,
         zk_application_mask_domain: None,
@@ -1380,9 +1469,15 @@ fn direct_merkle_component_security_bits(
 fn direct_commitment_binding_events(args: &Args, witness_rounds: usize) -> Result<usize, String> {
     match args.proof_mode {
         ProofMode::NoZk => witness_rounds.checked_add(1),
+        // Keep the separate-tree upper bound used by setup, including when
+        // the SPARK consumer batches fresh masks at an unchanged schedule.
         ProofMode::FullZk => witness_rounds
-            .checked_mul(5)
-            .and_then(|rounds| rounds.checked_add(8)),
+            .checked_mul(2)
+            .and_then(|n| n.checked_add(3))
+            .and_then(|fresh| {
+                spartan_whir::security::full_zk_witness_commitment_events(witness_rounds, fresh)
+                    .ok()
+            }),
     }
     .ok_or_else(|| "DirectSparse commitment event count overflows".to_owned())
 }
@@ -1589,6 +1684,175 @@ where
                 .saturating_mul(row_width(final_round.folding_factor))
                 .saturating_mul(final_payload_degree::<Base, Ext, Challenger>(config)),
         )
+}
+
+#[derive(Debug, Clone, Copy)]
+struct VerifierWorkEstimate {
+    merkle_hashes: u128,
+    leaf_field_elements: u128,
+    row_field_elements: u128,
+    extension_operations: u128,
+    pow_checks: u128,
+}
+
+fn verifier_work<Base, Ext, Challenger>(
+    config: &P3WhirConfig<Ext, Base, Challenger>,
+    terminal_pow_bits: usize,
+) -> VerifierWorkEstimate
+where
+    Base: TwoAdicField,
+    Ext: ExtensionField<Base> + Field + TwoAdicField,
+    Challenger: FieldChallenger<Base> + GrindingChallenger<Witness = Base>,
+{
+    let final_round = final_round_estimate(config);
+    let final_poly_field_elements =
+        row_width(config.final_sumcheck_rounds).saturating_mul(Ext::DIMENSION as u128);
+    let queried_row_field_elements = row_work::<Base, Ext, Challenger>(config);
+
+    let sumcheck_rounds = (0..=config.n_rounds())
+        .map(|round| config.round_folding_factor(round) as u128)
+        .fold(config.final_sumcheck_rounds as u128, u128::saturating_add);
+    let constraint_operations = config
+        .round_parameters
+        .iter()
+        .map(|round| {
+            let queries =
+                actual_query_count(round.num_queries, round.domain_size, round.folding_factor);
+            (queries.saturating_add(round.ood_samples as u128))
+                .saturating_mul(round.num_variables as u128)
+        })
+        .fold(0, u128::saturating_add)
+        .saturating_add(
+            final_query_count(config).saturating_mul(final_round.folding_factor as u128),
+        );
+
+    VerifierWorkEstimate {
+        merkle_hashes: verifier_merkle_hashes(config),
+        leaf_field_elements: queried_row_field_elements,
+        row_field_elements: queried_row_field_elements.saturating_add(final_poly_field_elements),
+        // Each sumcheck round reconstructs and evaluates a low-degree univariate;
+        // constraint materialization is linear in the number of claims and variables.
+        extension_operations: sumcheck_rounds
+            .saturating_mul(6)
+            .saturating_add(constraint_operations.saturating_mul(2)),
+        pow_checks: verifier_pow_checks(config, terminal_pow_bits),
+    }
+}
+
+fn verifier_merkle_hashes<Base, Ext, Challenger>(
+    config: &P3WhirConfig<Ext, Base, Challenger>,
+) -> u128
+where
+    Base: TwoAdicField,
+    Ext: ExtensionField<Base> + Field + TwoAdicField,
+    Challenger: FieldChallenger<Base> + GrindingChallenger<Witness = Base>,
+{
+    config
+        .round_parameters
+        .iter()
+        .map(|round| {
+            expected_merkle_multiproof_hashes(
+                folded_row_count(round.domain_size, round.folding_factor),
+                actual_query_count(round.num_queries, round.domain_size, round.folding_factor)
+                    as usize,
+            )
+        })
+        .fold(0, u128::saturating_add)
+        .saturating_add(expected_merkle_multiproof_hashes(
+            folded_row_count(
+                final_round_estimate(config).domain_size,
+                final_round_estimate(config).folding_factor,
+            ),
+            final_query_count(config) as usize,
+        ))
+}
+
+fn zk_merkle_multiproof_hashes<Base, Ext, Challenger>(
+    config: &P3WhirConfig<Ext, Base, Challenger>,
+    mask_queries: usize,
+    sumcheck_mask_domain: usize,
+    switch_mask_domains: &[usize],
+    application_mask: ApplicationMaskEstimate,
+    base_mask_width: u128,
+) -> u128
+where
+    Base: TwoAdicField,
+    Ext: ExtensionField<Base> + Field + TwoAdicField,
+    Challenger: FieldChallenger<Base> + GrindingChallenger<Witness = Base>,
+{
+    let switch_masks = switch_mask_domains
+        .iter()
+        .map(|domain| expected_merkle_multiproof_hashes(*domain, mask_queries))
+        .fold(0, u128::saturating_add);
+    let sumcheck_masks = expected_merkle_multiproof_hashes(sumcheck_mask_domain, mask_queries)
+        .saturating_mul((config.n_rounds() + 1) as u128);
+    let carried_masks = expected_merkle_multiproof_hashes(sumcheck_mask_domain, mask_queries)
+        .saturating_mul(base_mask_width);
+    let application_masks =
+        expected_merkle_multiproof_hashes(application_mask.domain_size, mask_queries)
+            .saturating_mul(2);
+    switch_masks
+        .saturating_add(sumcheck_masks)
+        .saturating_add(carried_masks)
+        .saturating_add(application_masks)
+}
+
+fn expected_merkle_multiproof_hashes(leaves: usize, queries: usize) -> u128 {
+    if leaves <= 1 || queries == 0 {
+        return 0;
+    }
+    let queries = queries.min(leaves);
+    let mut block_size = 2usize;
+    let mut hashes = 0.0;
+    while block_size <= leaves {
+        let blocks = leaves / block_size;
+        let mut none_probability = 1.0;
+        for selected in 0..queries {
+            let remaining = leaves - selected;
+            let outside = leaves.saturating_sub(block_size).saturating_sub(selected);
+            if outside == 0 {
+                none_probability = 0.0;
+                break;
+            }
+            none_probability *= outside as f64 / remaining as f64;
+        }
+        hashes += blocks as f64 * (1.0 - none_probability);
+        block_size = block_size.saturating_mul(2);
+        if block_size == 0 {
+            break;
+        }
+    }
+    hashes.round() as u128
+}
+
+fn verifier_pow_checks<Base, Ext, Challenger>(
+    config: &P3WhirConfig<Ext, Base, Challenger>,
+    terminal_pow_bits: usize,
+) -> u128
+where
+    Base: TwoAdicField,
+    Ext: ExtensionField<Base> + Field + TwoAdicField,
+    Challenger: FieldChallenger<Base> + GrindingChallenger<Witness = Base>,
+{
+    let mut checks = 0u128;
+    if config.starting_folding_pow_bits > 0 {
+        checks = checks.saturating_add(config.round_folding_factor(0) as u128);
+    }
+    for (round_index, round) in config.round_parameters.iter().enumerate() {
+        if round.pow_bits > 0 {
+            checks = checks.saturating_add(1);
+        }
+        if round.folding_pow_bits > 0 {
+            checks = checks.saturating_add(config.round_folding_factor(round_index + 1) as u128);
+        }
+    }
+    if terminal_pow_bits > 0 {
+        checks = checks.saturating_add(1);
+    }
+    if config.final_folding_pow_bits > 0 {
+        checks = checks.saturating_add(config.final_sumcheck_rounds as u128);
+    }
+    checks
 }
 
 fn proof_size_bytes_estimate<Base, Ext, Challenger>(
@@ -2032,10 +2296,10 @@ mod tests {
         let args = direct_security_test_args(ProofMode::FullZk, 116);
         assert_eq!(
             direct_commitment_binding_events(&args, 5).expect("commitment count fits"),
-            33
+            34
         );
         assert_eq!(
-            three_way_budget_slack(33).expect("slack calculation fits"),
+            three_way_budget_slack(34).expect("slack calculation fits"),
             7
         );
     }
@@ -2452,6 +2716,13 @@ mod tests {
     }
 
     #[test]
+    fn verifier_merkle_work_counts_reconstructed_multiproof_nodes() {
+        assert_eq!(expected_merkle_multiproof_hashes(8, 0), 0);
+        assert_eq!(expected_merkle_multiproof_hashes(8, 1), 3);
+        assert_eq!(expected_merkle_multiproof_hashes(8, 8), 7);
+    }
+
+    #[test]
     fn application_mask_rejects_mismatched_domains() {
         let args = Args {
             field: FieldProfile::KoalaBear,
@@ -2542,6 +2813,13 @@ mod tests {
             merkle_path_work: 0,
             row_work: 0,
             sumcheck_work: 0,
+            verifier: VerifierWorkEstimate {
+                merkle_hashes: 0,
+                leaf_field_elements: 0,
+                row_field_elements: 0,
+                extension_operations: 0,
+                pow_checks: 0,
+            },
         };
         let estimate = zk_estimates(&args, &config, base);
         let application_rows = (application.domain_size as u128)

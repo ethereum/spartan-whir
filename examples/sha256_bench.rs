@@ -443,7 +443,7 @@ fn prove_and_verify_poseidon_plonky3_full_zk(
         let _profile = spartan_whir::profiling::profile_scope("linked_witness_generation");
         generator.generate_witness(input_binary, shape.num_vars, shape.num_io)?
     };
-    let mut prover_challenger = spartan_whir::poseidon_challenger();
+    let mut prover_challenger = spartan_whir::poseidon_zk_challenger();
     let (instance, proof) = Protocol::prove(&pk, &public_inputs, &witness, &mut prover_challenger)
         .map_err(|err| format!("{label} full-ZK Poseidon prove failed: {err}"))?;
     drop(_prove_profile);
@@ -451,7 +451,7 @@ fn prove_and_verify_poseidon_plonky3_full_zk(
 
     let verify_start = Instant::now();
     let _verify_profile = spartan_whir::profiling::profile_scope("verify");
-    let mut verifier_challenger = spartan_whir::poseidon_challenger();
+    let mut verifier_challenger = spartan_whir::poseidon_zk_challenger();
     Protocol::verify(&vk, &instance, &proof, &mut verifier_challenger)
         .map_err(|err| format!("{label} full-ZK Poseidon verify failed: {err}"))?;
     drop(_verify_profile);

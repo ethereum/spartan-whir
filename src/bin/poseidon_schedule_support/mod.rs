@@ -167,9 +167,10 @@ fn checked_output(command: &str, output: std::process::Output) -> Result<String,
 }
 
 pub const fn enabled_features() -> &'static str {
-    if cfg!(feature = "parallel") {
-        "parallel"
-    } else {
-        ""
+    match (cfg!(feature = "parallel"), cfg!(feature = "poseidon1")) {
+        (true, true) => "parallel,poseidon1",
+        (true, false) => "parallel",
+        (false, true) => "poseidon1",
+        (false, false) => "",
     }
 }

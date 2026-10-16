@@ -251,14 +251,43 @@ fn witness_commitment_events(
     mode: SpartanSoundnessMode,
 ) -> Result<usize, SpartanWhirError> {
     match mode {
-        SpartanSoundnessMode::NoZk => witness_rounds.checked_add(1),
-        // Three top-level roots, n+1 relation sumcheck-mask roots, two roots
-        // per code-switch round, and 2n+4 base-case fresh roots.
-        SpartanSoundnessMode::FullZk { .. } => witness_rounds
-            .checked_mul(5)
-            .and_then(|events| events.checked_add(8)),
+        SpartanSoundnessMode::NoZk => witness_rounds
+            .checked_add(1)
+            .ok_or_else(composed_budget_overflow),
+        // Setup retains the separate-tree budget so batching never weakens the
+        // selected security target or changes the derived query schedules.
+        SpartanSoundnessMode::FullZk { .. } => full_zk_witness_commitment_events(
+            witness_rounds,
+            witness_rounds
+                .checked_mul(2)
+                .and_then(|n| n.checked_add(3))
+                .ok_or_else(composed_budget_overflow)?,
+        ),
     }
-    .ok_or_else(composed_budget_overflow)
+}
+
+/// Count witness commitment binding events for the actual fresh-mask batch count.
+///
+/// The setup budget uses the separate-tree upper bound. Reporting a smaller
+/// same-height count does not reduce the configured Merkle security target.
+pub fn full_zk_witness_commitment_events(
+    witness_rounds: usize,
+    fresh_mask_batches: usize,
+) -> Result<usize, SpartanWhirError> {
+    let max_groups = witness_rounds
+        .checked_mul(2)
+        .and_then(|n| n.checked_add(3))
+        .ok_or_else(composed_budget_overflow)?;
+    if fresh_mask_batches == 0 || fresh_mask_batches > max_groups {
+        return Err(composed_budget_overflow());
+    }
+    // Three application roots, n+1 relation sumcheck roots, 2n switch
+    // roots, the fresh main root, the reveal digest, and one fresh root per batch.
+    witness_rounds
+        .checked_mul(3)
+        .and_then(|n| n.checked_add(6))
+        .and_then(|n| n.checked_add(fresh_mask_batches))
+        .ok_or_else(composed_budget_overflow)
 }
 
 fn compose_security_budget<Ext>(
@@ -386,7 +415,7 @@ mod composed_tests {
     fn full_zk_counts_every_poseidon_commitment() {
         let events = witness_commitment_events(5, SpartanSoundnessMode::FullZk { inner_degree: 3 })
             .expect("commitment count fits");
-        assert_eq!(events, 33);
+        assert_eq!(events, 34);
 
         let (internal, budget) =
             compose_security_budget::<OcticBinExtension>(&config(116), 100, 1, events)

@@ -21,15 +21,33 @@ use spartan_whir::{
     recommended_quintic_spark_zk_whir_params, recommended_quintic_whir_params,
     recommended_quintic_zk_whir_params, MatrixClosingMode, MlePcs, OcticBinExtension,
     Plonky3WhirPcs, PoseidonChallenger, PoseidonEngine, PoseidonSpartanProtocol,
-    PoseidonZkProvingKey, PoseidonZkSetupConfig, PoseidonZkSpartanProtocol, PoseidonZkVerifyingKey,
-    ProvingKey, QuinticExtension, R1csInstance, SecurityConfig, SoundnessAssumption,
-    SparkWhirParams, SpartanProofKind, SpartanSnarkConfig, VerifyingKey, WhirParams,
-    ZkMatrixClosingProof, ZkSpartanProof, MAX_SECURITY_BITS, MIN_SECURITY_BITS,
+    PoseidonZkSetupConfig, ProvingKey, QuinticExtension, R1csInstance, SecurityConfig,
+    SoundnessAssumption, SparkWhirParams, SpartanProofKind, SpartanSnarkConfig, VerifyingKey,
+    WhirParams, MAX_SECURITY_BITS, MIN_SECURITY_BITS,
+};
+
+#[cfg(feature = "poseidon1")]
+use spartan_whir::{
+    poseidon1_challenger as poseidon_zk_challenger, Poseidon1Challenger as PoseidonZkChallenger,
+    Poseidon1ZkCommitment as PoseidonZkCommitment,
+    Poseidon1ZkMatrixClosingProof as ZkMatrixClosingProof,
+    Poseidon1ZkProvingKey as PoseidonZkProvingKey, Poseidon1ZkSpartanProof as ZkSpartanProof,
+    Poseidon1ZkSpartanProtocol as PoseidonZkSpartanProtocol,
+    Poseidon1ZkVerifyingKey as PoseidonZkVerifyingKey,
+};
+#[cfg(not(feature = "poseidon1"))]
+use spartan_whir::{
+    poseidon_zk_challenger, PoseidonZkChallenger, PoseidonZkCommitment, PoseidonZkProvingKey,
+    PoseidonZkSpartanProtocol, PoseidonZkVerifyingKey, ZkMatrixClosingProof, ZkSpartanProof,
 };
 
 const DEFAULT_SHA256_SIZE: usize = 2048;
 const DEFAULT_CORPUS_SIZE: usize = 16;
 const FULL_ZK_SEED: u64 = 0x5A25_6B32_4655_4C4C;
+#[cfg(feature = "poseidon1")]
+const HASH_PROFILE: &str = "poseidon1";
+#[cfg(not(feature = "poseidon1"))]
+const HASH_PROFILE: &str = "poseidon2";
 
 type PlainProtocol<Ext> = PoseidonSpartanProtocol<Ext>;
 type FullZkProtocol<Ext> = PoseidonZkSpartanProtocol<Ext>;
@@ -40,6 +58,7 @@ type FullZkProvingKey<Ext> = PoseidonZkProvingKey<Ext>;
 type FullZkVerifyingKey<Ext> = PoseidonZkVerifyingKey<Ext>;
 type Commitment<Ext> = <Plonky3WhirPcs as MlePcs<Engine<Ext>>>::Commitment;
 type Instance<Ext> = R1csInstance<F, Commitment<Ext>>;
+type FullZkInstance = R1csInstance<F, PoseidonZkCommitment>;
 type PlainProof<Ext> = SpartanProofKind<Engine<Ext>, Plonky3WhirPcs>;
 type FullZkProof<Ext> = ZkSpartanProof<Ext>;
 
@@ -64,8 +83,8 @@ where
 {
     no_zk_direct: Vec<(Instance<Ext>, PlainProof<Ext>)>,
     no_zk_spark: Vec<(Instance<Ext>, PlainProof<Ext>)>,
-    full_zk_direct: Vec<(Instance<Ext>, FullZkProof<Ext>)>,
-    full_zk_spark: Vec<(Instance<Ext>, FullZkProof<Ext>)>,
+    full_zk_direct: Vec<(FullZkInstance, FullZkProof<Ext>)>,
+    full_zk_spark: Vec<(FullZkInstance, FullZkProof<Ext>)>,
 }
 
 #[derive(Clone, Copy)]
@@ -108,6 +127,7 @@ impl BenchmarkVariants {
 
 fn benchmark_sha256_full_zk(c: &mut Criterion) {
     init_profile_tracing();
+    println!("hash_profile: {HASH_PROFILE}");
     let sha256_size = env_usize("SHA256_ZK_BENCH_SIZE", DEFAULT_SHA256_SIZE);
     let single_variant = single_proving_variant();
     match env_string("SHA256_ZK_BENCH_EXTENSION", "selected").as_str() {
@@ -184,6 +204,7 @@ fn benchmark_extension<Ext>(
         + CanSampleUniformBits<F>
         + FieldChallenger<F>
         + GrindingChallenger<Witness = F>,
+    PoseidonZkChallenger: CanObserve<PoseidonZkCommitment>,
 {
     let fixture = Sha256Fixture::load(sha256_size)
         .unwrap_or_else(|error| panic!("failed to load SHA-256 benchmark fixture: {error}"));
@@ -270,6 +291,7 @@ fn benchmark_single_proving<Ext>(
         + CanSampleUniformBits<F>
         + FieldChallenger<F>
         + GrindingChallenger<Witness = F>,
+    PoseidonZkChallenger: CanObserve<PoseidonZkCommitment>,
 {
     assert!(
         (MIN_SECURITY_BITS..=MAX_SECURITY_BITS).contains(&security_bits),
@@ -341,8 +363,47 @@ fn benchmark_single_proving<Ext>(
                     spartan_whir::DEFAULT_ZK_MASK_LOG_INV_RATE,
                 ),
             };
-            let (pk, _) = FullZkProvingKey::<Ext>::setup(fixture.shape.clone(), config)
+            let (pk, vk) = FullZkProvingKey::<Ext>::setup(fixture.shape.clone(), config)
                 .expect("full-ZK DirectSparse setup succeeds at selected security");
+            if env_flag("SHA256_ZK_BENCH_DIAGNOSTICS") {
+                let mut proof_sizes = Vec::with_capacity(inputs.len());
+                let mut verification_time = Duration::ZERO;
+                for (sample, input) in inputs.iter().enumerate() {
+                    let (witness, public_inputs) = fixture
+                        .generator
+                        .generate_witness(input, fixture.shape.num_vars, fixture.shape.num_io)
+                        .expect("full-ZK DirectSparse diagnostic witness generation succeeds");
+                    let mut prover = poseidon_zk_challenger();
+                    let mut rng = sample_rng(sample);
+                    let (instance, proof) = FullZkProtocol::<Ext>::prove_with_rng(
+                        &pk,
+                        &public_inputs,
+                        &witness,
+                        &mut prover,
+                        &mut rng,
+                    )
+                    .expect("full-ZK DirectSparse diagnostic proving succeeds");
+                    proof_sizes.push(
+                        bincode::serialize(&proof)
+                            .expect("full-ZK DirectSparse diagnostic proof serializes")
+                            .len(),
+                    );
+                    let verify_start = std::time::Instant::now();
+                    let mut verifier = poseidon_zk_challenger();
+                    FullZkProtocol::<Ext>::verify(&vk, &instance, &proof, &mut verifier)
+                        .expect("full-ZK DirectSparse diagnostic verification succeeds");
+                    verification_time += verify_start.elapsed();
+                }
+                proof_sizes.sort_unstable();
+                println!(
+                    "diagnostic: profile={HASH_PROFILE} variant=full_zk_direct samples={} proof_size_bytes_min={} proof_size_bytes_median={} proof_size_bytes_max={} verify_mean_ms={:.3}",
+                    proof_sizes.len(),
+                    proof_sizes[0],
+                    proof_sizes[proof_sizes.len() / 2],
+                    proof_sizes[proof_sizes.len() - 1],
+                    verification_time.as_secs_f64() * 1_000.0 / proof_sizes.len() as f64,
+                );
+            }
             let mut sample_index = 0usize;
             group.bench_function(BenchmarkId::from_parameter("full_zk_direct"), |bencher| {
                 bencher.iter_batched(
@@ -356,7 +417,7 @@ fn benchmark_single_proving<Ext>(
                             .generator
                             .generate_witness(&input, fixture.shape.num_vars, fixture.shape.num_io)
                             .expect("full-ZK DirectSparse witness generation succeeds");
-                        let mut challenger = spartan_whir::poseidon_challenger();
+                        let mut challenger = poseidon_zk_challenger();
                         black_box(
                             FullZkProtocol::<Ext>::prove_with_rng(
                                 &pk,
@@ -434,8 +495,47 @@ fn benchmark_single_proving<Ext>(
                     spartan_whir::DEFAULT_ZK_MASK_LOG_INV_RATE,
                 ),
             };
-            let (pk, _) = FullZkProvingKey::<Ext>::setup(fixture.shape.clone(), config)
+            let (pk, vk) = FullZkProvingKey::<Ext>::setup(fixture.shape.clone(), config)
                 .expect("full-ZK SPARK setup succeeds at selected security");
+            if env_flag("SHA256_ZK_BENCH_DIAGNOSTICS") {
+                let mut proof_sizes = Vec::with_capacity(inputs.len());
+                let mut verification_time = Duration::ZERO;
+                for (sample, input) in inputs.iter().enumerate() {
+                    let (witness, public_inputs) = fixture
+                        .generator
+                        .generate_witness(input, fixture.shape.num_vars, fixture.shape.num_io)
+                        .expect("full-ZK SPARK diagnostic witness generation succeeds");
+                    let mut prover = poseidon_zk_challenger();
+                    let mut rng = sample_rng(sample);
+                    let (instance, proof) = FullZkProtocol::<Ext>::prove_with_rng(
+                        &pk,
+                        &public_inputs,
+                        &witness,
+                        &mut prover,
+                        &mut rng,
+                    )
+                    .expect("full-ZK SPARK diagnostic proving succeeds");
+                    proof_sizes.push(
+                        bincode::serialize(&proof)
+                            .expect("full-ZK SPARK diagnostic proof serializes")
+                            .len(),
+                    );
+                    let verify_start = std::time::Instant::now();
+                    let mut verifier = poseidon_zk_challenger();
+                    FullZkProtocol::<Ext>::verify(&vk, &instance, &proof, &mut verifier)
+                        .expect("full-ZK SPARK diagnostic verification succeeds");
+                    verification_time += verify_start.elapsed();
+                }
+                proof_sizes.sort_unstable();
+                println!(
+                    "diagnostic: profile={HASH_PROFILE} variant=full_zk_spark samples={} proof_size_bytes_min={} proof_size_bytes_median={} proof_size_bytes_max={} verify_mean_ms={:.3}",
+                    proof_sizes.len(),
+                    proof_sizes[0],
+                    proof_sizes[proof_sizes.len() / 2],
+                    proof_sizes[proof_sizes.len() - 1],
+                    verification_time.as_secs_f64() * 1_000.0 / proof_sizes.len() as f64,
+                );
+            }
             let mut sample_index = 0usize;
             group.bench_function(BenchmarkId::from_parameter("full_zk_spark"), |bencher| {
                 bencher.iter_batched(
@@ -455,7 +555,7 @@ fn benchmark_single_proving<Ext>(
                             .generator
                             .generate_witness(&input, fixture.shape.num_vars, fixture.shape.num_io)
                             .expect("full-ZK SPARK witness generation succeeds");
-                        let mut challenger = spartan_whir::poseidon_challenger();
+                        let mut challenger = poseidon_zk_challenger();
                         black_box(
                             FullZkProtocol::<Ext>::prove_with_rng(
                                 &pk,
@@ -487,6 +587,7 @@ where
         + CanSampleUniformBits<F>
         + FieldChallenger<F>
         + GrindingChallenger<Witness = F>,
+    PoseidonZkChallenger: CanObserve<PoseidonZkCommitment>,
 {
     let security_bits = env_usize("SHA256_ZK_BENCH_SECURITY_BITS", 116) as u32;
     assert!(
@@ -537,6 +638,7 @@ fn benchmark_proving<Ext>(
         + CanSampleUniformBits<F>
         + FieldChallenger<F>
         + GrindingChallenger<Witness = F>,
+    PoseidonZkChallenger: CanObserve<PoseidonZkCommitment>,
 {
     let mut group = c.benchmark_group(format!(
         "sha256_{sha256_size}b_{extension}/witness_and_prove"
@@ -622,7 +724,7 @@ fn benchmark_proving<Ext>(
                         .generator
                         .generate_witness(&input, fixture.shape.num_vars, fixture.shape.num_io)
                         .expect("full-ZK witness generation succeeds");
-                    let mut challenger = spartan_whir::poseidon_challenger();
+                    let mut challenger = poseidon_zk_challenger();
                     black_box(
                         FullZkProtocol::<Ext>::prove_with_rng(
                             pk,
@@ -658,7 +760,7 @@ fn benchmark_proving<Ext>(
                         .generator
                         .generate_witness(&input, fixture.shape.num_vars, fixture.shape.num_io)
                         .expect("full-ZK SPARK witness generation succeeds");
-                    let mut challenger = spartan_whir::poseidon_challenger();
+                    let mut challenger = poseidon_zk_challenger();
                     black_box(
                         FullZkProtocol::<Ext>::prove_with_rng(
                             pk,
@@ -691,6 +793,7 @@ where
         + CanSampleUniformBits<F>
         + FieldChallenger<F>
         + GrindingChallenger<Witness = F>,
+    PoseidonZkChallenger: CanObserve<PoseidonZkCommitment>,
 {
     let mut corpus = ProofCorpus {
         no_zk_direct: Vec::with_capacity(inputs.len()),
@@ -741,7 +844,7 @@ where
 
         if let Some((pk, vk)) = &keys.full_zk_direct {
             let mut rng = sample_rng(sample);
-            let mut prover = spartan_whir::poseidon_challenger();
+            let mut prover = poseidon_zk_challenger();
             let proof = FullZkProtocol::<Ext>::prove_with_rng(
                 pk,
                 &public_inputs,
@@ -750,7 +853,7 @@ where
                 &mut rng,
             )
             .expect("verification-corpus full-ZK DirectSparse proof succeeds");
-            let mut verifier = spartan_whir::poseidon_challenger();
+            let mut verifier = poseidon_zk_challenger();
             FullZkProtocol::<Ext>::verify(vk, &proof.0, &proof.1, &mut verifier)
                 .expect("verification-corpus full-ZK DirectSparse proof verifies");
             corpus.full_zk_direct.push(proof);
@@ -758,7 +861,7 @@ where
 
         if let Some((pk, vk)) = &keys.full_zk_spark {
             let mut rng = sample_rng(sample);
-            let mut prover = spartan_whir::poseidon_challenger();
+            let mut prover = poseidon_zk_challenger();
             let proof = FullZkProtocol::<Ext>::prove_with_rng(
                 pk,
                 &public_inputs,
@@ -767,7 +870,7 @@ where
                 &mut rng,
             )
             .expect("verification-corpus full-ZK SPARK proof succeeds");
-            let mut verifier = spartan_whir::poseidon_challenger();
+            let mut verifier = poseidon_zk_challenger();
             FullZkProtocol::<Ext>::verify(vk, &proof.0, &proof.1, &mut verifier)
                 .expect("verification-corpus full-ZK SPARK proof verifies");
             corpus.full_zk_spark.push(proof);
@@ -789,6 +892,7 @@ fn benchmark_verification<Ext>(
         + CanSampleUniformBits<F>
         + FieldChallenger<F>
         + GrindingChallenger<Witness = F>,
+    PoseidonZkChallenger: CanObserve<PoseidonZkCommitment>,
 {
     let mut group = c.benchmark_group(format!("sha256_{sha256_size}b_{extension}/verify"));
     if let Some((_, vk)) = &keys.no_zk_direct {
@@ -856,7 +960,7 @@ fn benchmark_verification<Ext>(
                     (instance, proof)
                 },
                 |(instance, proof)| {
-                    let mut challenger = spartan_whir::poseidon_challenger();
+                    let mut challenger = poseidon_zk_challenger();
                     black_box(
                         FullZkProtocol::<Ext>::verify(vk, instance, proof, &mut challenger)
                             .expect("full-ZK DirectSparse verification succeeds"),
@@ -878,7 +982,7 @@ fn benchmark_verification<Ext>(
                     (instance, proof)
                 },
                 |(instance, proof)| {
-                    let mut challenger = spartan_whir::poseidon_challenger();
+                    let mut challenger = poseidon_zk_challenger();
                     black_box(
                         FullZkProtocol::<Ext>::verify(vk, instance, proof, &mut challenger)
                             .expect("full-ZK SPARK verification succeeds"),
@@ -949,12 +1053,12 @@ fn report_variant_size<T, P: Serialize>(variant: &str, proofs: &[(T, P)]) {
             .map(|(_, proof)| bincode::serialize(proof).expect("proof serializes").len()),
     );
     println!(
-        "proof_size_bytes: variant={variant} min={} median={} max={}",
+        "proof_size_bytes: profile={HASH_PROFILE} variant={variant} min={} median={} max={}",
         stats.min, stats.median, stats.max
     );
 }
 
-fn report_full_zk_sections<Ext>(variant: &str, proofs: &[(Instance<Ext>, FullZkProof<Ext>)])
+fn report_full_zk_sections<Ext>(variant: &str, proofs: &[(FullZkInstance, FullZkProof<Ext>)])
 where
     Ext: ExtField + Serialize,
     StandardUniform: Distribution<Ext>,
@@ -992,7 +1096,7 @@ where
             .len()
     }));
     println!(
-        "full_zk_proof_sections_median_bytes: variant={variant} application_mask_commitments={} outer_iop={} inner_iop={} matrix_closing={} pcs_relation={}",
+        "full_zk_proof_sections_median_bytes: profile={HASH_PROFILE} variant={variant} application_mask_commitments={} outer_iop={} inner_iop={} matrix_closing={} pcs_relation={}",
         application_masks.median,
         outer_iop.median,
         inner_iop.median,

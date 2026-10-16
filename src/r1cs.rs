@@ -1,11 +1,22 @@
 use alloc::{vec, vec::Vec};
 use core::cmp::max;
 
-use p3_field::{ExtensionField, Field, PackedFieldExtension, PackedValue, PrimeCharacteristicRing};
+use p3_field::{
+    ExtensionField, Field, PackedFieldExtension, PackedValue, PrimeCharacteristicRing, PrimeField32,
+};
 use p3_maybe_rayon::prelude::*;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
-use crate::{Evaluations, SpartanWhirError};
+use crate::{engine::F, Evaluations, SpartanWhirError};
+
+/// Domain for the canonical digest of a KoalaBear R1CS relation.
+pub const R1CS_RELATION_DIGEST_DOMAIN: &[u8] = b"spartan-whir-r1cs-relation-digest";
+/// Encoding version for [`canonical_r1cs_relation_digest`].
+pub const R1CS_RELATION_DIGEST_VERSION: u32 = 1;
+
+const R1CS_RELATION_FIELD_ID: &[u8] = b"koalabear-prime-field";
+const R1CS_RELATION_COLUMN_LAYOUT_ID: &[u8] = b"witness-constant-public";
 
 const R1CS_PARALLEL_MATRIX_MIN_NNZ: usize = 1 << 14;
 const R1CS_PARALLEL_BIND_MIN_NNZ: usize = 1 << 15;
@@ -89,6 +100,130 @@ struct RowMatrixLayout {
 pub struct R1csInstance<F, C> {
     pub public_inputs: Vec<F>,
     pub witness_commitment: C,
+}
+
+/// Compute a canonical SHA-256 digest of a padded KoalaBear R1CS relation.
+///
+/// The digest includes both the original dimensions and the padded shape. A
+/// sparse matrix is encoded by sorted `(row, column)` coordinates after
+/// duplicate entries have been added in the field and zero sums removed.
+/// This is the generated-statement digest used by the Fiat-Shamir mitigation
+/// described in Fenzi, ePrint 2026/1838:
+/// <https://eprint.iacr.org/2026/1838>.
+pub fn canonical_r1cs_relation_digest(
+    shape_canonical: &R1csShape<F>,
+    num_cons_unpadded: usize,
+    num_vars_unpadded: usize,
+    num_io: usize,
+) -> Result<[u8; 32], SpartanWhirError> {
+    shape_canonical.validate()?;
+
+    let mut hasher = Sha256::new();
+    relation_digest_bytes(&mut hasher, R1CS_RELATION_DIGEST_DOMAIN)?;
+    hasher.update(R1CS_RELATION_DIGEST_VERSION.to_le_bytes());
+    relation_digest_bytes(&mut hasher, R1CS_RELATION_FIELD_ID)?;
+    hasher.update((F::ORDER_U32 as u64).to_le_bytes());
+    relation_digest_bytes(&mut hasher, R1CS_RELATION_COLUMN_LAYOUT_ID)?;
+
+    for dimension in [
+        num_cons_unpadded,
+        num_vars_unpadded,
+        num_io,
+        shape_canonical.num_cons,
+        shape_canonical.num_vars,
+        shape_canonical.num_io,
+    ] {
+        relation_digest_usize(&mut hasher, dimension)?;
+    }
+
+    for (tag, matrix) in [
+        (b"A".as_slice(), &shape_canonical.a),
+        (b"B".as_slice(), &shape_canonical.b),
+        (b"C".as_slice(), &shape_canonical.c),
+    ] {
+        relation_digest_matrix(&mut hasher, tag, matrix)?;
+    }
+
+    Ok(hasher.finalize().into())
+}
+
+fn relation_digest_matrix(
+    hasher: &mut Sha256,
+    tag: &[u8],
+    matrix: &SparseMatrix<F>,
+) -> Result<(), SpartanWhirError> {
+    relation_digest_bytes(hasher, tag)?;
+    relation_digest_usize(hasher, matrix.num_rows)?;
+    relation_digest_usize(hasher, matrix.num_cols)?;
+
+    if matrix.entries.iter().all(|entry| entry.val != F::ZERO)
+        && matrix
+            .entries
+            .windows(2)
+            .all(|entries| (entries[0].row, entries[0].col) < (entries[1].row, entries[1].col))
+    {
+        relation_digest_usize(hasher, matrix.entries.len())?;
+        for entry in &matrix.entries {
+            relation_digest_entry(hasher, entry.row, entry.col, entry.val)?;
+        }
+        return Ok(());
+    }
+
+    let mut entries = matrix.entries.iter().collect::<Vec<_>>();
+    entries.sort_unstable_by_key(|entry| (entry.row, entry.col));
+    let canonical_len = canonical_matrix_entries(&entries)
+        .filter(|(_, _, value)| *value != F::ZERO)
+        .count();
+    relation_digest_usize(hasher, canonical_len)?;
+    for (row, col, value) in canonical_matrix_entries(&entries) {
+        if value != F::ZERO {
+            relation_digest_entry(hasher, row, col, value)?;
+        }
+    }
+    Ok(())
+}
+
+fn canonical_matrix_entries<'a>(
+    entries: &'a [&'a SparseMatEntry<F>],
+) -> impl Iterator<Item = (usize, usize, F)> + 'a {
+    let mut index = 0;
+    core::iter::from_fn(move || {
+        let first = entries.get(index)?;
+        let (row, col) = (first.row, first.col);
+        let mut value = F::ZERO;
+        while let Some(entry) = entries.get(index) {
+            if (entry.row, entry.col) != (row, col) {
+                break;
+            }
+            value += entry.val;
+            index += 1;
+        }
+        Some((row, col, value))
+    })
+}
+
+fn relation_digest_entry(
+    hasher: &mut Sha256,
+    row: usize,
+    col: usize,
+    value: F,
+) -> Result<(), SpartanWhirError> {
+    relation_digest_usize(hasher, row)?;
+    relation_digest_usize(hasher, col)?;
+    hasher.update(value.as_canonical_u32().to_le_bytes());
+    Ok(())
+}
+
+fn relation_digest_bytes(hasher: &mut Sha256, bytes: &[u8]) -> Result<(), SpartanWhirError> {
+    relation_digest_usize(hasher, bytes.len())?;
+    hasher.update(bytes);
+    Ok(())
+}
+
+fn relation_digest_usize(hasher: &mut Sha256, value: usize) -> Result<(), SpartanWhirError> {
+    let value = u64::try_from(value).map_err(|_| SpartanWhirError::InvalidR1csShape)?;
+    hasher.update(value.to_le_bytes());
+    Ok(())
 }
 
 impl<F> R1csShape<F> {
@@ -1011,7 +1146,151 @@ mod tests {
     use p3_field::PrimeCharacteristicRing;
 
     use super::*;
-    use crate::{engine::F, EqPolynomial, QuarticBinExtension as EF};
+    use crate::{EqPolynomial, QuarticBinExtension as EF};
+
+    fn digest_test_shape() -> R1csShape<F> {
+        R1csShape {
+            num_cons: 2,
+            num_vars: 2,
+            num_io: 0,
+            a: SparseMatrix {
+                num_rows: 2,
+                num_cols: 3,
+                entries: vec![SparseMatEntry {
+                    row: 0,
+                    col: 0,
+                    val: F::from_u32(3),
+                }],
+            },
+            b: SparseMatrix {
+                num_rows: 2,
+                num_cols: 3,
+                entries: vec![SparseMatEntry {
+                    row: 0,
+                    col: 1,
+                    val: F::from_u32(5),
+                }],
+            },
+            c: SparseMatrix {
+                num_rows: 2,
+                num_cols: 3,
+                entries: vec![SparseMatEntry {
+                    row: 0,
+                    col: 2,
+                    val: F::from_u32(15),
+                }],
+            },
+        }
+    }
+
+    #[test]
+    fn relation_digest_has_a_stable_encoding() {
+        let digest = canonical_r1cs_relation_digest(&digest_test_shape(), 2, 2, 0)
+            .expect("valid shape hashes");
+
+        assert_eq!(
+            digest,
+            [
+                201, 22, 54, 128, 54, 224, 52, 41, 209, 185, 15, 138, 87, 234, 221, 180, 10, 97,
+                89, 226, 32, 49, 56, 235, 131, 55, 43, 233, 49, 174, 104, 235,
+            ]
+        );
+    }
+
+    #[test]
+    fn relation_digest_canonicalizes_sparse_matrix_entries() {
+        let shape = digest_test_shape();
+        let mut equivalent = shape.clone();
+        equivalent.a.entries = vec![
+            SparseMatEntry {
+                row: 1,
+                col: 1,
+                val: F::from_u32(7),
+            },
+            SparseMatEntry {
+                row: 0,
+                col: 0,
+                val: F::ONE,
+            },
+            SparseMatEntry {
+                row: 1,
+                col: 1,
+                val: -F::from_u32(7),
+            },
+            SparseMatEntry {
+                row: 0,
+                col: 2,
+                val: F::ZERO,
+            },
+            SparseMatEntry {
+                row: 0,
+                col: 0,
+                val: F::from_u32(2),
+            },
+        ];
+
+        assert_eq!(
+            canonical_r1cs_relation_digest(&shape, 2, 2, 0).expect("valid shape hashes"),
+            canonical_r1cs_relation_digest(&equivalent, 2, 2, 0).expect("equivalent shape hashes")
+        );
+    }
+
+    #[test]
+    fn relation_digest_changes_with_relation_and_matrix_tag() {
+        let shape = digest_test_shape();
+        let expected = canonical_r1cs_relation_digest(&shape, 2, 2, 0).expect("valid shape hashes");
+
+        let mut changed_value = shape.clone();
+        changed_value.a.entries[0].val += F::ONE;
+        assert_ne!(
+            expected,
+            canonical_r1cs_relation_digest(&changed_value, 2, 2, 0).expect("changed shape hashes")
+        );
+
+        let mut changed_matrix = shape.clone();
+        changed_matrix
+            .b
+            .entries
+            .push(changed_matrix.a.entries.remove(0));
+        assert_ne!(
+            expected,
+            canonical_r1cs_relation_digest(&changed_matrix, 2, 2, 0)
+                .expect("retagged shape hashes")
+        );
+    }
+
+    #[test]
+    fn relation_digest_binds_original_and_padded_dimensions() {
+        let shape = digest_test_shape();
+        let expected = canonical_r1cs_relation_digest(&shape, 2, 2, 0).expect("valid shape hashes");
+        assert_ne!(
+            expected,
+            canonical_r1cs_relation_digest(&shape, 1, 2, 0)
+                .expect("different original dimensions hash")
+        );
+
+        let mut padded = shape.clone();
+        padded.num_cons = 4;
+        padded.a.num_rows = 4;
+        padded.b.num_rows = 4;
+        padded.c.num_rows = 4;
+        assert_ne!(
+            expected,
+            canonical_r1cs_relation_digest(&padded, 2, 2, 0)
+                .expect("different padded dimensions hash")
+        );
+    }
+
+    #[test]
+    fn relation_digest_rejects_invalid_shape() {
+        let mut shape = digest_test_shape();
+        shape.a.entries[0].row = shape.num_cons;
+
+        assert_eq!(
+            canonical_r1cs_relation_digest(&shape, 2, 2, 0),
+            Err(SpartanWhirError::InvalidR1csShape)
+        );
+    }
 
     fn repeated_entries(seed: usize, num_rows: usize, num_cols: usize) -> Vec<SparseMatEntry<F>> {
         let entry_count = (R1CS_PARALLEL_BIND_MIN_NNZ / 3) + 257;

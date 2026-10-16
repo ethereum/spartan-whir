@@ -5,16 +5,37 @@ use p3_whir::pcs::proof::QueryOpenings;
 use rand::{rngs::StdRng, SeedableRng};
 use spartan_whir::plonky3_whir_pcs::PoseidonCommitment;
 use spartan_whir::{
-    engine::F, generate_satisfiable_fixture, setup_poseidon, setup_poseidon_zk,
-    InvalidConfigReason, MatrixClosingMode, PoseidonProof, PoseidonProofKind, PoseidonProvingKey,
-    PoseidonSetupConfig, PoseidonVerifyingKey, PoseidonZkProof, PoseidonZkProvingKey,
-    PoseidonZkSetupConfig, PoseidonZkVerifyingKey, QuarticBinExtension, SpartanSnarkConfig,
-    SpartanWhirError, SyntheticR1csConfig, ZkMatrixClosingProof,
+    canonical_r1cs_relation_digest, engine::F, generate_satisfiable_fixture, setup_poseidon,
+    setup_poseidon_zk, InvalidConfigReason, MatrixClosingMode, PoseidonProof, PoseidonProofKind,
+    PoseidonProvingKey, PoseidonSetupConfig, PoseidonVerifyingKey, PoseidonZkProof,
+    PoseidonZkProvingKey, PoseidonZkSetupConfig, PoseidonZkVerifyingKey, QuarticBinExtension,
+    R1csShape, SpartanSnarkConfig, SpartanWhirError, SyntheticR1csConfig, ZkMatrixClosingProof,
 };
 
 fn duplicate_cap_root(commitment: &PoseidonCommitment) -> PoseidonCommitment {
     let root = commitment.roots()[0];
     PoseidonCommitment::new(vec![root, root])
+}
+
+fn refresh_serialized_relation_digest(encoded: &mut serde_json::Value) {
+    let shape: R1csShape<F> = serde_json::from_value(encoded["shape_canonical"].clone())
+        .expect("serialized relation decodes");
+    let num_cons_unpadded = encoded["num_cons_unpadded"]
+        .as_u64()
+        .expect("serialized unpadded constraint count is an integer")
+        as usize;
+    let num_vars_unpadded = encoded["num_vars_unpadded"]
+        .as_u64()
+        .expect("serialized unpadded variable count is an integer")
+        as usize;
+    let num_io = encoded["num_io"]
+        .as_u64()
+        .expect("serialized public input count is an integer") as usize;
+    let digest =
+        canonical_r1cs_relation_digest(&shape, num_cons_unpadded, num_vars_unpadded, num_io)
+            .expect("changed relation hashes");
+    encoded["domain_separator"]["relation_digest"] =
+        serde_json::to_value(digest).expect("relation digest serializes");
 }
 
 fn config(mode: MatrixClosingMode) -> PoseidonSetupConfig {
@@ -323,6 +344,7 @@ fn poseidon_spark_verifying_key_authenticates_fixed_commitments() {
         .as_u64()
         .expect("matrix column is an integer");
     vk_json["shape_canonical"]["a"]["entries"][0]["col"] = serde_json::json!(col ^ 1);
+    refresh_serialized_relation_digest(&mut vk_json);
     let mut forged: PoseidonVerifyingKey<QuarticBinExtension> =
         serde_json::from_value(vk_json).expect("forged key deserializes");
     assert_eq!(
@@ -347,6 +369,7 @@ fn poseidon_full_zk_spark_verifying_key_authenticates_fixed_commitments() {
         .as_u64()
         .expect("matrix column is an integer");
     vk_json["shape_canonical"]["a"]["entries"][0]["col"] = serde_json::json!(col ^ 1);
+    refresh_serialized_relation_digest(&mut vk_json);
     let mut forged: PoseidonZkVerifyingKey<QuarticBinExtension> =
         serde_json::from_value(vk_json).expect("forged key deserializes");
     assert_eq!(
@@ -375,12 +398,21 @@ fn poseidon_deployment_types_are_serializable() {
 
     let mut pk_roundtrip: PoseidonProvingKey<QuarticBinExtension> =
         bincode::deserialize(&pk_bytes).expect("proving key deserializes");
-    let vk_roundtrip: PoseidonVerifyingKey<QuarticBinExtension> =
+    let mut vk_roundtrip: PoseidonVerifyingKey<QuarticBinExtension> =
         bincode::deserialize(&vk_bytes).expect("verifying key deserializes");
     let proof_roundtrip: PoseidonProof<QuarticBinExtension> =
         serde_json::from_slice(&proof_bytes).expect("proof deserializes");
 
     assert_eq!(pk_roundtrip.matrix_closing, MatrixClosingMode::DirectSparse);
+    assert_eq!(
+        vk_roundtrip.verify(&proof_roundtrip.instance.public_inputs, &proof_roundtrip),
+        Err(SpartanWhirError::InvalidConfig(
+            InvalidConfigReason::UnauthenticatedVerifyingKey
+        ))
+    );
+    vk_roundtrip
+        .authenticate()
+        .expect("deserialized verifying key authenticates");
     vk_roundtrip
         .verify(&proof_roundtrip.instance.public_inputs, &proof_roundtrip)
         .expect("deserialized verifying key verifies deserialized proof");
@@ -422,31 +454,28 @@ fn poseidon_deployment_types_are_serializable() {
 #[test]
 fn poseidon_verifier_rejects_malformed_serialized_key_without_panicking() {
     let fixture = fixture();
-    let (pk, vk) = setup_poseidon::<QuarticBinExtension>(
+    let (_, vk) = setup_poseidon::<QuarticBinExtension>(
         fixture.shape,
         config(MatrixClosingMode::DirectSparse),
     )
     .expect("setup succeeds");
-    let proof = pk
-        .prove(fixture.witness, fixture.public_inputs)
-        .expect("prove succeeds");
 
     let mut encoded = serde_json::to_value(&vk).expect("verifying key serializes");
     encoded["shape_canonical"]["num_cons"] = serde_json::json!(0);
-    let malformed: PoseidonVerifyingKey<QuarticBinExtension> =
+    let mut malformed: PoseidonVerifyingKey<QuarticBinExtension> =
         serde_json::from_value(encoded).expect("malformed key remains syntactically valid");
 
     assert_eq!(
-        malformed.verify(&proof.instance.public_inputs, &proof),
+        malformed.authenticate(),
         Err(SpartanWhirError::InvalidR1csShape)
     );
 
     let mut encoded = serde_json::to_value(&vk).expect("verifying key serializes");
     encoded["pcs_config"]["security"]["security_level_bits"] = serde_json::json!(80);
-    let malformed: PoseidonVerifyingKey<QuarticBinExtension> =
+    let mut malformed: PoseidonVerifyingKey<QuarticBinExtension> =
         serde_json::from_value(encoded).expect("malformed key remains syntactically valid");
     assert_eq!(
-        malformed.verify(&proof.instance.public_inputs, &proof),
+        malformed.authenticate(),
         Err(SpartanWhirError::invalid_config())
     );
 }
@@ -471,11 +500,20 @@ fn poseidon_full_zk_deployment_api_is_serializable() {
         bincode::deserialize(&bytes).expect("full-ZK proof deserializes");
     let mut pk_roundtrip: PoseidonZkProvingKey<QuarticBinExtension> =
         bincode::deserialize(&pk_bytes).expect("full-ZK proving key deserializes");
-    let vk_roundtrip: PoseidonZkVerifyingKey<QuarticBinExtension> =
+    let mut vk_roundtrip: PoseidonZkVerifyingKey<QuarticBinExtension> =
         bincode::deserialize(&vk_bytes).expect("full-ZK verifying key deserializes");
 
     vk.verify(&decoded.instance.public_inputs, &decoded)
         .expect("deserialized full-ZK proof verifies");
+    assert_eq!(
+        vk_roundtrip.verify(&decoded.instance.public_inputs, &decoded),
+        Err(SpartanWhirError::InvalidConfig(
+            InvalidConfigReason::UnauthenticatedVerifyingKey
+        ))
+    );
+    vk_roundtrip
+        .authenticate()
+        .expect("deserialized full-ZK verifying key authenticates");
     vk_roundtrip
         .verify(&decoded.instance.public_inputs, &decoded)
         .expect("deserialized full-ZK verifying key verifies");
@@ -501,31 +539,28 @@ fn poseidon_full_zk_deployment_api_is_serializable() {
 #[test]
 fn poseidon_full_zk_verifier_rejects_malformed_serialized_key_without_panicking() {
     let fixture = fixture();
-    let (pk, vk) = setup_poseidon_zk::<QuarticBinExtension>(
+    let (_, vk) = setup_poseidon_zk::<QuarticBinExtension>(
         fixture.shape,
         zk_config(MatrixClosingMode::DirectSparse),
     )
     .expect("full-ZK setup succeeds");
-    let proof = pk
-        .prove(fixture.witness, fixture.public_inputs)
-        .expect("full-ZK proof succeeds");
 
     let mut encoded = serde_json::to_value(&vk).expect("full-ZK verifying key serializes");
     encoded["shape_canonical"]["num_cons"] = serde_json::json!(0);
-    let malformed: PoseidonZkVerifyingKey<QuarticBinExtension> =
+    let mut malformed: PoseidonZkVerifyingKey<QuarticBinExtension> =
         serde_json::from_value(encoded).expect("malformed key remains syntactically valid");
 
     assert_eq!(
-        malformed.verify(&proof.instance.public_inputs, &proof),
+        malformed.authenticate(),
         Err(SpartanWhirError::InvalidR1csShape)
     );
 
     let mut encoded = serde_json::to_value(&vk).expect("full-ZK verifying key serializes");
     encoded["pcs_config"]["base"]["security"]["security_level_bits"] = serde_json::json!(80);
-    let malformed: PoseidonZkVerifyingKey<QuarticBinExtension> =
+    let mut malformed: PoseidonZkVerifyingKey<QuarticBinExtension> =
         serde_json::from_value(encoded).expect("malformed key remains syntactically valid");
     assert_eq!(
-        malformed.verify(&proof.instance.public_inputs, &proof),
+        malformed.authenticate(),
         Err(SpartanWhirError::invalid_config())
     );
 }
@@ -538,24 +573,19 @@ fn poseidon_full_zk_spark_rejects_malformed_serialized_keys() {
         zk_config(MatrixClosingMode::Spark),
     )
     .expect("full-ZK SPARK setup succeeds");
-    let proof = pk
-        .prove(fixture.witness, fixture.public_inputs)
-        .expect("full-ZK SPARK proof succeeds");
 
     let mut encoded = serde_json::to_value(&vk).expect("verifying key serializes");
     encoded["spark_pcs_configs"]["fixed_value"]["num_variables"] = serde_json::json!(0);
-    let malformed: PoseidonZkVerifyingKey<QuarticBinExtension> =
+    let mut malformed: PoseidonZkVerifyingKey<QuarticBinExtension> =
         serde_json::from_value(encoded).expect("malformed key remains syntactically valid");
-    assert!(malformed
-        .verify(&proof.instance.public_inputs, &proof)
-        .is_err());
+    assert!(malformed.authenticate().is_err());
 
     let mut encoded = serde_json::to_value(&vk).expect("verifying key serializes");
     encoded["spark_table_metadata"]["value_domain_size"] = serde_json::json!(1);
-    let malformed: PoseidonZkVerifyingKey<QuarticBinExtension> =
+    let mut malformed: PoseidonZkVerifyingKey<QuarticBinExtension> =
         serde_json::from_value(encoded).expect("malformed key remains syntactically valid");
     assert_eq!(
-        malformed.verify(&proof.instance.public_inputs, &proof),
+        malformed.authenticate(),
         Err(SpartanWhirError::InvalidR1csShape)
     );
 
@@ -638,7 +668,7 @@ fn poseidon_full_zk_spark_key_is_reusable_and_serializable() {
     assert_eq!(
         restored_vk.verify(&restored.instance.public_inputs, &restored),
         Err(SpartanWhirError::InvalidConfig(
-            InvalidConfigReason::UnauthenticatedSparkVerifyingKey
+            InvalidConfigReason::UnauthenticatedVerifyingKey
         ))
     );
     restored_vk
@@ -716,7 +746,7 @@ fn poseidon_spark_proving_key_is_serializable() {
     assert_eq!(
         vk_roundtrip.verify(&roundtrip_proof.instance.public_inputs, &roundtrip_proof),
         Err(SpartanWhirError::InvalidConfig(
-            InvalidConfigReason::UnauthenticatedSparkVerifyingKey
+            InvalidConfigReason::UnauthenticatedVerifyingKey
         ))
     );
     vk_roundtrip

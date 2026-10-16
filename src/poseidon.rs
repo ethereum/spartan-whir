@@ -1,6 +1,7 @@
 use alloc::vec::Vec;
 use core::marker::PhantomData;
 use p3_challenger::{CanObserve, CanSampleUniformBits, FieldChallenger, GrindingChallenger};
+use p3_whir::pcs::zk::MaskGroupProverData;
 use rand::{
     distr::{Distribution, StandardUniform},
     CryptoRng, Rng,
@@ -8,13 +9,19 @@ use rand::{
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    engine::{poseidon_challenger, ExtField, PoseidonChallenger, PoseidonEngine, F},
-    plonky3_whir_pcs::{build_poseidon_full_zk_pcs, PoseidonCommitment},
+    engine::{
+        poseidon_challenger, ExtField, Poseidon1Engine, PoseidonChallenger, PoseidonEngine, F,
+    },
+    plonky3_whir_pcs::{
+        build_poseidon_full_zk_pcs, FullZkPoseidonEngine, FullZkPoseidonPcs,
+        PoseidonZkCommitmentFor, PoseidonZkMmcsFor,
+    },
     preprocess_spark_tables,
     protocol::{
         combined_application_mask_shape, setup_spark_fixed_commitments,
         spark_pcs_configs_for_tables, validate_canonical_verifying_shape,
-        validate_spark_table_metadata, PoseidonZkSpartanProtocol, SparkFixedProverData,
+        validate_spark_table_metadata, PoseidonZkSpartanProtocolFor, SparkFixedProverData,
+        ZkSpartanProofFor,
     },
     r1cs::{DirectBindLayout, DirectMultiplyLayout},
     security::{
@@ -23,8 +30,27 @@ use crate::{
     DomainSeparator, MatrixClosingMode, MlePcs, Plonky3WhirPcs, R1csInstance, R1csShape,
     R1csWitness, SecurityConfig, SparkFixedCommitments, SparkPcsConfigs, SparkTableMetadata,
     SparkTables, SparkWhirParams, SpartanProofKind, SpartanProtocol, SpartanSnarkConfig,
-    SpartanWhirError, WhirParams, ZkSpartanProof, ZkWhirPcsConfig,
+    SpartanWhirError, WhirParams, ZkWhirPcsConfig,
 };
+
+fn full_zk_protocol_id<E: FullZkPoseidonEngine>(
+    batching: crate::pcs_config::FreshMaskBatching,
+    packing: crate::pcs_config::MaskPacking,
+) -> Vec<u8>
+where
+    E::EF: ExtField,
+    E::Challenger: FieldChallenger<F> + GrindingChallenger<Witness = F>,
+{
+    let mut id = E::FULL_ZK_PROTOCOL_ID.to_vec();
+    if batching == crate::pcs_config::FreshMaskBatching::SameHeight {
+        id.extend_from_slice(b"-fresh-mask-batching-v1");
+    }
+    if packing != crate::pcs_config::MaskPacking::Off {
+        id.extend_from_slice(b"-mask-packing-v1-");
+        id.extend_from_slice(packing.label().as_bytes());
+    }
+    id
+}
 
 pub type PoseidonSetupConfig = SpartanSnarkConfig;
 pub type PoseidonProofKind<Ext> = SpartanProofKind<PoseidonEngine<Ext>, Plonky3WhirPcs>;
@@ -42,10 +68,16 @@ pub struct PoseidonZkSetupConfig {
 
 #[derive(Serialize, Deserialize)]
 #[serde(bound(
-    serialize = "crate::plonky3_whir_pcs::Plonky3WhirProverData<Ext>: Serialize",
-    deserialize = "crate::plonky3_whir_pcs::Plonky3WhirProverData<Ext>: Deserialize<'de>"
+    serialize = "<Plonky3WhirPcs as MlePcs<E>>::ProverData: Serialize",
+    deserialize = "<Plonky3WhirPcs as MlePcs<E>>::ProverData: Deserialize<'de>"
 ))]
-pub struct PoseidonZkProvingKey<Ext: ExtField> {
+pub struct PoseidonZkProvingKeyFor<E>
+where
+    E: FullZkPoseidonEngine,
+    E::EF: ExtField,
+    E::Challenger: FieldChallenger<F> + GrindingChallenger<Witness = F>,
+    Plonky3WhirPcs: FullZkPoseidonPcs<E>,
+{
     pub matrix_closing: MatrixClosingMode,
     pub(crate) shape_canonical: R1csShape<F>,
     pub(crate) num_cons_unpadded: usize,
@@ -54,10 +86,9 @@ pub struct PoseidonZkProvingKey<Ext: ExtField> {
     pub(crate) security: SecurityConfig,
     pub(crate) whir_params: WhirParams,
     pub(crate) pcs_config: ZkWhirPcsConfig,
-    pub(crate) spark_fixed_commitments: Option<SparkFixedCommitments<PoseidonCommitment>>,
+    pub(crate) spark_fixed_commitments: Option<SparkFixedCommitments<PoseidonZkCommitmentFor<E>>>,
     pub(crate) spark_pcs_configs: Option<SparkPcsConfigs>,
-    pub(crate) spark_fixed_prover_data:
-        Option<SparkFixedProverData<PoseidonEngine<Ext>, Plonky3WhirPcs>>,
+    pub(crate) spark_fixed_prover_data: Option<SparkFixedProverData<E, Plonky3WhirPcs>>,
     #[serde(default)]
     pub(crate) spark_tables: Option<SparkTables>,
     pub(crate) domain_separator: DomainSeparator,
@@ -65,12 +96,18 @@ pub struct PoseidonZkProvingKey<Ext: ExtField> {
     pub(crate) direct_bind_layout: Option<DirectBindLayout<F>>,
     #[serde(skip)]
     pub(crate) direct_multiply_layout: Option<DirectMultiplyLayout>,
-    marker: PhantomData<Ext>,
+    marker: PhantomData<E>,
 }
 
 #[derive(Serialize, Deserialize)]
 #[serde(bound(serialize = "", deserialize = ""))]
-pub struct PoseidonZkVerifyingKey<Ext: ExtField> {
+pub struct PoseidonZkVerifyingKeyFor<E>
+where
+    E: FullZkPoseidonEngine,
+    E::EF: ExtField,
+    E::Challenger: FieldChallenger<F> + GrindingChallenger<Witness = F>,
+    Plonky3WhirPcs: FullZkPoseidonPcs<E>,
+{
     pub matrix_closing: MatrixClosingMode,
     pub(crate) shape_canonical: R1csShape<F>,
     pub(crate) num_cons_unpadded: usize,
@@ -80,19 +117,35 @@ pub struct PoseidonZkVerifyingKey<Ext: ExtField> {
     pub(crate) whir_params: WhirParams,
     pub(crate) pcs_config: ZkWhirPcsConfig,
     /// SPARK fixed-table Merkle roots produced at setup.
-    pub(crate) spark_fixed_commitments: Option<SparkFixedCommitments<PoseidonCommitment>>,
+    pub(crate) spark_fixed_commitments: Option<SparkFixedCommitments<PoseidonZkCommitmentFor<E>>>,
     pub(crate) spark_pcs_configs: Option<SparkPcsConfigs>,
     #[serde(default)]
     pub(crate) spark_table_metadata: Option<SparkTableMetadata>,
     pub(crate) domain_separator: DomainSeparator,
-    /// Setup authenticates this binding directly. Serialization omits the
-    /// marker, so a restored SPARK key must re-authenticate before use.
+    /// Setup authenticates the relation digest and, in SPARK mode, the fixed
+    /// commitments. Serialization omits the marker, so every restored key must
+    /// be authenticated once before verification.
     #[serde(skip)]
-    pub(crate) spark_fixed_commitments_authenticated: bool,
-    marker: PhantomData<Ext>,
+    pub(crate) verifying_key_authenticated: bool,
+    marker: PhantomData<E>,
 }
 
-impl<Ext: ExtField> PoseidonZkProvingKey<Ext> {
+pub type PoseidonZkProvingKey<Ext> = PoseidonZkProvingKeyFor<PoseidonEngine<Ext>>;
+pub type PoseidonZkVerifyingKey<Ext> = PoseidonZkVerifyingKeyFor<PoseidonEngine<Ext>>;
+pub type Poseidon1ZkProvingKey<Ext> = PoseidonZkProvingKeyFor<Poseidon1Engine<Ext>>;
+pub type Poseidon1ZkVerifyingKey<Ext> = PoseidonZkVerifyingKeyFor<Poseidon1Engine<Ext>>;
+
+impl<E> PoseidonZkProvingKeyFor<E>
+where
+    E: FullZkPoseidonEngine,
+    E::EF: ExtField,
+    E::Challenger: FieldChallenger<F> + GrindingChallenger<Witness = F>,
+    Plonky3WhirPcs: FullZkPoseidonPcs<E>,
+{
+    pub fn domain_separator(&self) -> &DomainSeparator {
+        &self.domain_separator
+    }
+
     pub fn prepare_for_proving(&mut self) -> Result<(), SpartanWhirError> {
         self.direct_bind_layout = Some(self.shape_canonical.direct_bind_layout()?);
         self.direct_multiply_layout = Some(self.shape_canonical.direct_multiply_layout()?);
@@ -120,21 +173,40 @@ impl<Ext: ExtField> PoseidonZkProvingKey<Ext> {
     }
 }
 
-impl<Ext: ExtField> PoseidonZkVerifyingKey<Ext> {
-    /// Check that the key's SPARK fixed-table commitments actually commit to
-    /// the matrices of the embedded R1CS.
+impl<E> PoseidonZkVerifyingKeyFor<E>
+where
+    E: FullZkPoseidonEngine,
+    E::EF: ExtField,
+    E::Challenger: CanObserve<PoseidonZkCommitmentFor<E>>
+        + FieldChallenger<F>
+        + GrindingChallenger<Witness = F>,
+    StandardUniform: Distribution<E::EF>,
+    Plonky3WhirPcs: FullZkPoseidonPcs<E>,
+{
+    pub fn domain_separator(&self) -> &DomainSeparator {
+        &self.domain_separator
+    }
+
+    /// Authenticate a setup-created or restored key against its embedded R1CS.
     ///
-    /// A restored SPARK key cannot verify until this succeeds. It re-runs
-    /// SPARK preprocessing and committing, so it costs about as much as the
-    /// SPARK part of `setup`.
-    pub fn authenticate_spark_fixed_commitments(&mut self) -> Result<(), SpartanWhirError> {
-        self.spark_fixed_commitments_authenticated = false;
+    /// This recomputes the canonical relation digest once. In SPARK mode it
+    /// also rebuilds and checks the fixed-table commitments, which costs about
+    /// as much as the SPARK part of `setup`. Verification then reuses the
+    /// authenticated digest without scanning the matrices again.
+    pub fn authenticate(&mut self) -> Result<(), SpartanWhirError> {
+        self.verifying_key_authenticated = false;
         self.validate()?;
+        let expected_relation_digest = crate::canonical_r1cs_relation_digest(
+            &self.shape_canonical,
+            self.num_cons_unpadded,
+            self.num_vars_unpadded,
+            self.num_io,
+        )?;
+        if self.domain_separator.relation_digest != expected_relation_digest {
+            return Err(SpartanWhirError::invalid_config());
+        }
         match self.matrix_closing {
-            MatrixClosingMode::DirectSparse => {
-                self.spark_fixed_commitments_authenticated = true;
-                Ok(())
-            }
+            MatrixClosingMode::DirectSparse => {}
             MatrixClosingMode::Spark => {
                 let configs = self
                     .spark_pcs_configs
@@ -144,30 +216,35 @@ impl<Ext: ExtField> PoseidonZkVerifyingKey<Ext> {
                     .spark_fixed_commitments
                     .as_ref()
                     .ok_or_else(SpartanWhirError::invalid_config)?;
-                crate::protocol::authenticate_spark_fixed_commitments::<
-                    PoseidonEngine<Ext>,
-                    Ext,
-                    Plonky3WhirPcs,
-                >(&self.shape_canonical, configs, expected)?;
-                self.spark_fixed_commitments_authenticated = true;
-                Ok(())
+                crate::protocol::authenticate_spark_fixed_commitments::<E, E::EF, Plonky3WhirPcs>(
+                    &self.shape_canonical,
+                    configs,
+                    expected,
+                )?;
             }
         }
+        self.verifying_key_authenticated = true;
+        Ok(())
     }
 
-    pub(crate) fn ensure_spark_fixed_commitments_authenticated(
-        &self,
-    ) -> Result<(), SpartanWhirError> {
-        if self.matrix_closing == MatrixClosingMode::Spark
-            && !self.spark_fixed_commitments_authenticated
-        {
+    /// Compatibility wrapper for callers that authenticated restored SPARK
+    /// keys through the previous API.
+    pub fn authenticate_spark_fixed_commitments(&mut self) -> Result<(), SpartanWhirError> {
+        self.authenticate()
+    }
+
+    pub(crate) fn ensure_authenticated(&self) -> Result<(), SpartanWhirError> {
+        if !self.verifying_key_authenticated {
             return Err(SpartanWhirError::invalid_config_reason(
-                crate::InvalidConfigReason::UnauthenticatedSparkVerifyingKey,
+                crate::InvalidConfigReason::UnauthenticatedVerifyingKey,
             ));
         }
         Ok(())
     }
 
+    /// Validate structure and configuration using the stored relation digest.
+    /// This does not recompute the relation digest; use [`Self::authenticate`]
+    /// before accepting restored key material.
     pub(crate) fn validate(&self) -> Result<Option<SparkTableMetadata>, SpartanWhirError> {
         validate_canonical_verifying_shape(
             &self.shape_canonical,
@@ -185,8 +262,13 @@ impl<Ext: ExtField> PoseidonZkVerifyingKey<Ext> {
         {
             return Err(SpartanWhirError::invalid_config());
         }
-        let expected_domain = DomainSeparator::new_full_zk(
+        let expected_domain = DomainSeparator::new_with_protocol_id_and_relation_digest(
+            &full_zk_protocol_id::<E>(
+                self.pcs_config.fresh_mask_batching,
+                self.pcs_config.mask_packing,
+            ),
             &self.shape_canonical,
+            self.domain_separator.relation_digest,
             &self.security,
             &self.whir_params,
             self.matrix_closing,
@@ -198,7 +280,7 @@ impl<Ext: ExtField> PoseidonZkVerifyingKey<Ext> {
 
         let spark_metadata = match self.matrix_closing {
             MatrixClosingMode::DirectSparse => {
-                let (expected_security, _) = derive_direct_component_security::<Ext>(
+                let (expected_security, _) = derive_direct_component_security::<E::EF>(
                     &self.security,
                     &self.pcs_config.base,
                     num_outer_rounds,
@@ -246,8 +328,8 @@ impl<Ext: ExtField> PoseidonZkVerifyingKey<Ext> {
                 let metadata = self
                     .spark_table_metadata
                     .ok_or_else(SpartanWhirError::invalid_config)?;
-                validate_spark_table_metadata::<Ext>(&self.shape_canonical, &metadata, configs)?;
-                let (expected_security, _) = derive_spark_component_security::<Ext>(
+                validate_spark_table_metadata::<E::EF>(&self.shape_canonical, &metadata, configs)?;
+                let (expected_security, _) = derive_spark_component_security::<E::EF>(
                     &self.security,
                     &metadata,
                     &self.pcs_config.base,
@@ -297,21 +379,31 @@ where
 /// Full witness-hiding Spartan-WHIR proof plus its public instance.
 #[derive(Serialize, Deserialize, Clone)]
 #[serde(bound(
-    serialize = "Ext: ExtField, ZkSpartanProof<Ext>: Serialize",
-    deserialize = "Ext: ExtField, ZkSpartanProof<Ext>: Deserialize<'de>"
+    serialize = "E::EF: ExtField, ZkSpartanProofFor<E>: Serialize",
+    deserialize = "E::EF: ExtField, ZkSpartanProofFor<E>: Deserialize<'de>"
 ))]
-pub struct PoseidonZkProof<Ext: ExtField>
+pub struct PoseidonZkProofFor<E>
 where
-    StandardUniform: Distribution<Ext>,
+    E: FullZkPoseidonEngine,
+    E::EF: ExtField,
+    E::Challenger: FieldChallenger<F> + GrindingChallenger<Witness = F>,
+    StandardUniform: Distribution<E::EF>,
+    Plonky3WhirPcs: FullZkPoseidonPcs<E>,
 {
-    pub instance: R1csInstance<F, PoseidonCommitment>,
-    pub proof: ZkSpartanProof<Ext>,
+    pub instance: R1csInstance<F, PoseidonZkCommitmentFor<E>>,
+    pub proof: ZkSpartanProofFor<E>,
 }
 
-impl<Ext> PoseidonZkProof<Ext>
+pub type PoseidonZkProof<Ext> = PoseidonZkProofFor<PoseidonEngine<Ext>>;
+pub type Poseidon1ZkProof<Ext> = PoseidonZkProofFor<Poseidon1Engine<Ext>>;
+
+impl<E> PoseidonZkProofFor<E>
 where
-    Ext: ExtField,
-    StandardUniform: Distribution<Ext>,
+    E: FullZkPoseidonEngine,
+    E::EF: ExtField,
+    E::Challenger: FieldChallenger<F> + GrindingChallenger<Witness = F>,
+    StandardUniform: Distribution<E::EF>,
+    Plonky3WhirPcs: FullZkPoseidonPcs<E>,
 {
     pub fn closing_mode(&self) -> MatrixClosingMode {
         self.proof.matrix_closing.mode()
@@ -360,13 +452,62 @@ where
     SpartanProtocol::<PoseidonEngine<Ext>, Plonky3WhirPcs>::setup_with_config(&shape, &config)
 }
 
-pub fn setup_poseidon_zk<Ext>(
+pub fn setup_poseidon_zk_for<E>(
     shape: R1csShape<F>,
     config: PoseidonZkSetupConfig,
-) -> Result<(PoseidonZkProvingKey<Ext>, PoseidonZkVerifyingKey<Ext>), SpartanWhirError>
+) -> Result<(PoseidonZkProvingKeyFor<E>, PoseidonZkVerifyingKeyFor<E>), SpartanWhirError>
 where
-    Ext: ExtField,
-    StandardUniform: Distribution<Ext>,
+    E: FullZkPoseidonEngine,
+    E::EF: ExtField,
+    E::Challenger: CanObserve<PoseidonZkCommitmentFor<E>>
+        + FieldChallenger<F>
+        + GrindingChallenger<Witness = F>,
+    StandardUniform: Distribution<E::EF>,
+    Plonky3WhirPcs: FullZkPoseidonPcs<E>,
+{
+    setup_poseidon_zk_with_fresh_mask_batching::<E>(
+        shape,
+        config,
+        crate::pcs_config::FreshMaskBatching::Separate,
+    )
+}
+
+pub fn setup_poseidon_zk_with_fresh_mask_batching<E>(
+    shape: R1csShape<F>,
+    config: PoseidonZkSetupConfig,
+    fresh_mask_batching: crate::pcs_config::FreshMaskBatching,
+) -> Result<(PoseidonZkProvingKeyFor<E>, PoseidonZkVerifyingKeyFor<E>), SpartanWhirError>
+where
+    E: FullZkPoseidonEngine,
+    E::EF: ExtField,
+    E::Challenger: CanObserve<PoseidonZkCommitmentFor<E>>
+        + FieldChallenger<F>
+        + GrindingChallenger<Witness = F>,
+    StandardUniform: Distribution<E::EF>,
+    Plonky3WhirPcs: FullZkPoseidonPcs<E>,
+{
+    setup_poseidon_zk_with_mask_packing::<E>(
+        shape,
+        config,
+        fresh_mask_batching,
+        crate::pcs_config::MaskPacking::Off,
+    )
+}
+
+pub fn setup_poseidon_zk_with_mask_packing<E>(
+    shape: R1csShape<F>,
+    config: PoseidonZkSetupConfig,
+    fresh_mask_batching: crate::pcs_config::FreshMaskBatching,
+    mask_packing: crate::pcs_config::MaskPacking,
+) -> Result<(PoseidonZkProvingKeyFor<E>, PoseidonZkVerifyingKeyFor<E>), SpartanWhirError>
+where
+    E: FullZkPoseidonEngine,
+    E::EF: ExtField,
+    E::Challenger: CanObserve<PoseidonZkCommitmentFor<E>>
+        + FieldChallenger<F>
+        + GrindingChallenger<Witness = F>,
+    StandardUniform: Distribution<E::EF>,
+    Plonky3WhirPcs: FullZkPoseidonPcs<E>,
 {
     config.security.validate()?;
     shape.validate()?;
@@ -389,7 +530,7 @@ where
     };
     let component_security = match spark_tables.as_ref() {
         None => {
-            derive_direct_component_security::<Ext>(
+            derive_direct_component_security::<E::EF>(
                 &config.security,
                 &provisional_base,
                 num_outer_rounds,
@@ -401,12 +542,12 @@ where
             .0
         }
         Some(tables) => {
-            let provisional_spark_configs = spark_pcs_configs_for_tables::<Ext>(
+            let provisional_spark_configs = spark_pcs_configs_for_tables::<E::EF>(
                 &provisional_base,
                 tables,
                 config.spark_whir_params.as_ref(),
             )?;
-            derive_spark_component_security::<Ext>(
+            derive_spark_component_security::<E::EF>(
                 &config.security,
                 &tables.metadata(),
                 &provisional_base,
@@ -427,37 +568,43 @@ where
         },
         ell_zk: config.ell_zk,
         mask_log_inv_rate: config.mask_log_inv_rate,
+        fresh_mask_batching,
+        mask_packing,
     };
-    let (_, [inner_shape, outer_shape, _]) = build_poseidon_full_zk_pcs::<Ext>(
+    let (_, [inner_shape, outer_shape, _]) = build_poseidon_full_zk_pcs::<E>(
         &pcs_config,
         num_outer_rounds,
         num_variables + 1,
         config.security.effective_security_bits(),
     )?;
-    combined_application_mask_shape(inner_shape, outer_shape)?;
+    combined_application_mask_shape(inner_shape, outer_shape, mask_packing)?;
     let transcript_spark_whir_params = match config.matrix_closing {
         MatrixClosingMode::DirectSparse => None,
         MatrixClosingMode::Spark => config.spark_whir_params.clone(),
     };
-    let domain_separator = DomainSeparator::new_full_zk(
+    let domain_separator = DomainSeparator::new_with_protocol_id(
+        &full_zk_protocol_id::<E>(fresh_mask_batching, mask_packing),
         &shape_canonical,
+        shape.num_cons,
+        shape.num_vars,
+        shape.num_io,
         &config.security,
         &config.whir_params,
         config.matrix_closing,
         transcript_spark_whir_params,
-    );
+    )?;
     let (spark_pcs_configs, spark_fixed_setup) = match config.matrix_closing {
         MatrixClosingMode::DirectSparse => (None, None),
         MatrixClosingMode::Spark => {
             let spark_tables = spark_tables
                 .as_ref()
                 .ok_or_else(SpartanWhirError::invalid_config)?;
-            let spark_pcs_configs = spark_pcs_configs_for_tables::<Ext>(
+            let spark_pcs_configs = spark_pcs_configs_for_tables::<E::EF>(
                 &pcs_config.base,
                 spark_tables,
                 config.spark_whir_params.as_ref(),
             )?;
-            let setup = setup_spark_fixed_commitments::<PoseidonEngine<Ext>, Ext, Plonky3WhirPcs>(
+            let setup = setup_spark_fixed_commitments::<E, E::EF, Plonky3WhirPcs>(
                 &spark_pcs_configs,
                 spark_tables,
             )?;
@@ -469,7 +616,7 @@ where
         None => (None, None),
     };
     let spark_table_metadata = spark_tables.as_ref().map(SparkTables::metadata);
-    let mut pk = PoseidonZkProvingKey {
+    let mut pk = PoseidonZkProvingKeyFor {
         matrix_closing: config.matrix_closing,
         shape_canonical: shape_canonical.clone(),
         num_cons_unpadded: shape.num_cons,
@@ -488,7 +635,7 @@ where
         marker: PhantomData,
     };
     pk.prepare_for_proving()?;
-    let vk = PoseidonZkVerifyingKey {
+    let vk = PoseidonZkVerifyingKeyFor {
         matrix_closing: config.matrix_closing,
         shape_canonical,
         num_cons_unpadded: shape.num_cons,
@@ -501,10 +648,32 @@ where
         spark_pcs_configs,
         spark_table_metadata,
         domain_separator,
-        spark_fixed_commitments_authenticated: true,
+        verifying_key_authenticated: true,
         marker: PhantomData,
     };
     Ok((pk, vk))
+}
+
+pub fn setup_poseidon_zk<Ext>(
+    shape: R1csShape<F>,
+    config: PoseidonZkSetupConfig,
+) -> Result<(PoseidonZkProvingKey<Ext>, PoseidonZkVerifyingKey<Ext>), SpartanWhirError>
+where
+    Ext: ExtField,
+    StandardUniform: Distribution<Ext>,
+{
+    setup_poseidon_zk_for::<PoseidonEngine<Ext>>(shape, config)
+}
+
+pub fn setup_poseidon1_zk<Ext>(
+    shape: R1csShape<F>,
+    config: PoseidonZkSetupConfig,
+) -> Result<(Poseidon1ZkProvingKey<Ext>, Poseidon1ZkVerifyingKey<Ext>), SpartanWhirError>
+where
+    Ext: ExtField,
+    StandardUniform: Distribution<Ext>,
+{
+    setup_poseidon_zk_for::<Poseidon1Engine<Ext>>(shape, config)
 }
 
 impl<Ext> crate::PoseidonProvingKey<Ext>
@@ -570,6 +739,7 @@ where
         expected_public_inputs: &[F],
         proof: &PoseidonProof<Ext>,
     ) -> Result<(), SpartanWhirError> {
+        self.ensure_authenticated()?;
         if expected_public_inputs.len() != self.num_io()
             || proof.instance.public_inputs.len() != self.num_io()
         {
@@ -588,32 +758,62 @@ where
     }
 }
 
-impl<Ext> PoseidonZkProvingKey<Ext>
+impl<E> PoseidonZkProvingKeyFor<E>
 where
-    Ext: ExtField + Serialize + for<'de> Deserialize<'de>,
-    StandardUniform: Distribution<Ext> + Distribution<F>,
-    PoseidonChallenger: CanObserve<PoseidonCommitment>,
+    E: FullZkPoseidonEngine,
+    E::EF: ExtField + Serialize + for<'de> Deserialize<'de>,
+    E::Challenger: CanObserve<PoseidonZkCommitmentFor<E>>
+        + CanSampleUniformBits<F>
+        + FieldChallenger<F>
+        + GrindingChallenger<Witness = F>
+        + Clone
+        + Send,
+    StandardUniform: Distribution<E::EF> + Distribution<F>,
+    Plonky3WhirPcs: FullZkPoseidonPcs<E>,
+    MaskGroupProverData<F, E::EF, PoseidonZkMmcsFor<E>>: Send,
 {
     pub fn setup(
         shape: R1csShape<F>,
         config: PoseidonZkSetupConfig,
-    ) -> Result<(Self, PoseidonZkVerifyingKey<Ext>), SpartanWhirError> {
-        setup_poseidon_zk(shape, config)
+    ) -> Result<(Self, PoseidonZkVerifyingKeyFor<E>), SpartanWhirError> {
+        setup_poseidon_zk_for::<E>(shape, config)
+    }
+
+    /// Set up a SPARK key with an explicit fresh-mask commitment policy.
+    pub fn setup_with_fresh_mask_batching(
+        shape: R1csShape<F>,
+        config: PoseidonZkSetupConfig,
+        batching: crate::pcs_config::FreshMaskBatching,
+    ) -> Result<(Self, PoseidonZkVerifyingKeyFor<E>), SpartanWhirError> {
+        if config.matrix_closing != MatrixClosingMode::Spark {
+            return Err(SpartanWhirError::invalid_config());
+        }
+        setup_poseidon_zk_with_fresh_mask_batching::<E>(shape, config, batching)
+    }
+
+    /// Set up a full-ZK key with authenticated physical mask packing.
+    pub fn setup_with_mask_packing(
+        shape: R1csShape<F>,
+        config: PoseidonZkSetupConfig,
+        batching: crate::pcs_config::FreshMaskBatching,
+        packing: crate::pcs_config::MaskPacking,
+    ) -> Result<(Self, PoseidonZkVerifyingKeyFor<E>), SpartanWhirError> {
+        setup_poseidon_zk_with_mask_packing::<E>(shape, config, batching, packing)
     }
 
     pub fn prove(
         &self,
         witness: R1csWitness<F>,
         public_inputs: Vec<F>,
-    ) -> Result<PoseidonZkProof<Ext>, SpartanWhirError> {
-        let mut challenger = poseidon_challenger();
-        let (instance, proof) = PoseidonZkSpartanProtocol::<Ext>::prove(
+    ) -> Result<PoseidonZkProofFor<E>, SpartanWhirError> {
+        let mut challenger = <E as crate::engine::Plonky3PoseidonEngine>::challenger();
+        let (instance, proof) = PoseidonZkSpartanProtocolFor::<E>::prove(
             self,
             &public_inputs,
             &witness,
             &mut challenger,
         )?;
-        Ok(PoseidonZkProof { instance, proof })
+        Ok(PoseidonZkProofFor { instance, proof })
     }
 
     pub fn prove_with_rng<R>(
@@ -621,27 +821,35 @@ where
         witness: R1csWitness<F>,
         public_inputs: Vec<F>,
         rng: &mut R,
-    ) -> Result<PoseidonZkProof<Ext>, SpartanWhirError>
+    ) -> Result<PoseidonZkProofFor<E>, SpartanWhirError>
     where
         R: Rng + CryptoRng,
     {
-        let mut challenger = poseidon_challenger();
-        let (instance, proof) = PoseidonZkSpartanProtocol::<Ext>::prove_with_rng(
+        let mut challenger = <E as crate::engine::Plonky3PoseidonEngine>::challenger();
+        let (instance, proof) = PoseidonZkSpartanProtocolFor::<E>::prove_with_rng(
             self,
             &public_inputs,
             &witness,
             &mut challenger,
             rng,
         )?;
-        Ok(PoseidonZkProof { instance, proof })
+        Ok(PoseidonZkProofFor { instance, proof })
     }
 }
 
-impl<Ext> PoseidonZkVerifyingKey<Ext>
+impl<E> PoseidonZkVerifyingKeyFor<E>
 where
-    Ext: ExtField + Serialize + for<'de> Deserialize<'de>,
-    StandardUniform: Distribution<Ext> + Distribution<F>,
-    PoseidonChallenger: CanObserve<PoseidonCommitment>,
+    E: FullZkPoseidonEngine,
+    E::EF: ExtField + Serialize + for<'de> Deserialize<'de>,
+    E::Challenger: CanObserve<PoseidonZkCommitmentFor<E>>
+        + CanSampleUniformBits<F>
+        + FieldChallenger<F>
+        + GrindingChallenger<Witness = F>
+        + Clone
+        + Send,
+    StandardUniform: Distribution<E::EF> + Distribution<F>,
+    Plonky3WhirPcs: FullZkPoseidonPcs<E>,
+    MaskGroupProverData<F, E::EF, PoseidonZkMmcsFor<E>>: Send,
 {
     /// Verify a proof against public inputs selected by the verifier.
     ///
@@ -650,8 +858,9 @@ where
     pub fn verify(
         &self,
         expected_public_inputs: &[F],
-        proof: &PoseidonZkProof<Ext>,
+        proof: &PoseidonZkProofFor<E>,
     ) -> Result<(), SpartanWhirError> {
+        self.ensure_authenticated()?;
         if expected_public_inputs.len() != self.num_io
             || proof.instance.public_inputs.len() != self.num_io
         {
@@ -660,8 +869,8 @@ where
         if proof.instance.public_inputs != expected_public_inputs {
             return Err(SpartanWhirError::PublicInputMismatch);
         }
-        let mut challenger = poseidon_challenger();
-        PoseidonZkSpartanProtocol::<Ext>::verify(
+        let mut challenger = <E as crate::engine::Plonky3PoseidonEngine>::challenger();
+        PoseidonZkSpartanProtocolFor::<E>::verify(
             self,
             &proof.instance,
             &proof.proof,
@@ -963,7 +1172,7 @@ mod witness_generator {
     where
         Ext: ExtField + Serialize + for<'de> Deserialize<'de>,
         StandardUniform: Distribution<Ext> + Distribution<F>,
-        PoseidonChallenger: CanObserve<PoseidonCommitment>,
+        PoseidonChallenger: CanObserve<crate::PoseidonZkCommitment>,
     {
         fn witness_from_generator(
             &self,

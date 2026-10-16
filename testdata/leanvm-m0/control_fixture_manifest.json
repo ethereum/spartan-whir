@@ -1,0 +1,152 @@
+{
+  "canonical_shape": {
+    "constraints": 2,
+    "public_inputs": 1,
+    "variables": 4
+  },
+  "field": {
+    "base": "KoalaBear",
+    "extension": "X^5 + X^2 - 1",
+    "extension_coordinate_order": [
+      "1",
+      "X",
+      "X^2",
+      "X^3",
+      "X^4"
+    ],
+    "modulus": 2130706433
+  },
+  "guest_constants": {
+    "bytes": 11954,
+    "file": "control_guest_constants.json",
+    "sha256": "84704a74b4d1a9d4ff078817822e1e5112ad2c69eafb1adecee373874549ce22"
+  },
+  "guest_input": {
+    "bytes": 1992,
+    "file": "control_guest_input.words",
+    "sha256": "05000cc597f9ff68565693cb991e17b70cbb47b77dc8fec15bdee06e887bd867"
+  },
+  "guest_input_version": 1,
+  "guest_input_word_limit": 1048576,
+  "guest_input_words": 498,
+  "manifest_version": 1,
+  "matrix_closing": "direct_sparse",
+  "mutations": [
+    {
+      "artifact": {
+        "bytes": 1992,
+        "file": "mutations/changed_public_input.words",
+        "sha256": "6e72e7576a39d0e1342c1a5ca19f09abd33fa1f7f02ca57e468a8a06e290b420"
+      },
+      "expected_result": "public inputs do not match expected statement",
+      "target": "application public input"
+    },
+    {
+      "artifact": {
+        "bytes": 1992,
+        "file": "mutations/changed_witness_commitment.words",
+        "sha256": "a83d528ef33cafa458ad7087f32838557b65db06cc7e23d0ad4859bda4473a29"
+      },
+      "expected_result": "sumcheck verification failed",
+      "target": "witness commitment"
+    },
+    {
+      "artifact": {
+        "bytes": 1992,
+        "file": "mutations/changed_outer_sumcheck.words",
+        "sha256": "22cc5cfd3541ed0eeac5eb95fc94f6e251efee83bbf2918c0cbfc2ec88bb2f98"
+      },
+      "expected_result": "sumcheck verification failed",
+      "target": "outer sumcheck"
+    },
+    {
+      "artifact": {
+        "bytes": 1992,
+        "file": "mutations/changed_outer_claim.words",
+        "sha256": "100b056554d6daa396b531700800b566f8d9bd3620903eeaf8d9ad83bac4fe5f"
+      },
+      "expected_result": "sumcheck verification failed",
+      "target": "outer claims"
+    },
+    {
+      "artifact": {
+        "bytes": 1992,
+        "file": "mutations/changed_inner_sumcheck.words",
+        "sha256": "70fcefa6ae69204b2cf4242759c5ec113102113e56443fd859dab0d3b28b6405"
+      },
+      "expected_result": "sumcheck verification failed",
+      "target": "inner sumcheck"
+    },
+    {
+      "artifact": {
+        "bytes": 1992,
+        "file": "mutations/changed_witness_evaluation.words",
+        "sha256": "bb2fbc39c7cd945addbf6817829b8d8d2a1a5c27015903fcd92cd0296e1b01f8"
+      },
+      "expected_result": "sumcheck verification failed",
+      "target": "witness evaluation"
+    },
+    {
+      "artifact": {
+        "bytes": 1992,
+        "file": "mutations/changed_whir_opening.words",
+        "sha256": "043ea547e9340db013c899d2f723a33ad7a357d30733593f63c3a8d298981ccc"
+      },
+      "expected_result": "WHIR verification failed",
+      "target": "WHIR opening"
+    },
+    {
+      "artifact": {
+        "bytes": 1992,
+        "file": "mutations/wrong_version.words",
+        "sha256": "c03edc060fdcae674a97d99c7e4c801d4a6c360b5f14b7ae5cabe60917520fa3"
+      },
+      "expected_result": "invalid blob header",
+      "target": "encoding version"
+    },
+    {
+      "artifact": {
+        "bytes": 1996,
+        "file": "mutations/trailing_word.words",
+        "sha256": "79388ba8509cccc1c022c3fccf1e70f19156404686de6b305e7fd9251ab3601a"
+      },
+      "expected_result": "trailing bytes",
+      "target": "exact proof consumption"
+    }
+  ],
+  "privacy_mode": "no_zk",
+  "profile_id": "spartan-whir-poseidon2-quintic-no-zk-direct-control-v1",
+  "profile_number": 1,
+  "security": {
+    "merkle_security_bits": 80,
+    "security_level_bits": 80,
+    "soundness_assumption": "CapacityBound"
+  },
+  "statement": {
+    "bytes": 641,
+    "file": "control_statement.json",
+    "sha256": "2cc289567636825577eeb675a67473086f5abc6fdfea571230be1f8e322d708a"
+  },
+  "synthetic_r1cs": {
+    "a_terms_per_constraint": 2,
+    "b_terms_per_constraint": 2,
+    "num_constraints": 2,
+    "num_io": 1,
+    "seed": 212334980463230,
+    "target_log2_witness_poly": 2
+  },
+  "transcript_events": 215,
+  "transcript_trace": {
+    "bytes": 17708,
+    "file": "control_transcript_trace.json",
+    "sha256": "acfddd1502c74ad951e6b3eb7969f2420ec7685fcf54875f657988263a38b343"
+  },
+  "whir_params": {
+    "folding_factor": 1,
+    "folding_schedule": null,
+    "pow_bits": 0,
+    "round_log_inv_rates": [],
+    "rs_domain_initial_reduction_factor": 1,
+    "starting_log_inv_rate": 6
+  }
+}

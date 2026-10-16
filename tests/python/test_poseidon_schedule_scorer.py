@@ -170,6 +170,18 @@ class PoseidonScheduleScorerTests(unittest.TestCase):
                 "sumcheck": 1.0,
                 "pow": 1.0,
             },
+            "verifier_coefficients": {
+                "fixed_overhead": 0.0,
+                "merkle_hash": 2.0,
+                "leaf_field_element": 0.0,
+                "row_field_element": 3.0,
+                "extension_operation": {
+                    "quartic": 4.0,
+                    "quintic": 5.0,
+                    "octic": 6.0,
+                },
+                "pow_check": 7.0,
+            },
             "validation": {
                 "max_relative_error": 0.10,
                 "heldout": validation_rows,
@@ -207,6 +219,25 @@ class PoseidonScheduleScorerTests(unittest.TestCase):
         dump = {"schema_version": 1, "proof_mode": "no-zk", "candidates": [candidate("a", merkle_path=7)]}
         report = self.score_dump(dump, self.calibration(), max_pow_bits=22)
         self.assertEqual(report["selected"]["cost_breakdown"]["merkle_path"], 7.0)
+
+    def test_verifier_projection_uses_independent_work_counters(self):
+        row = candidate("a", extension="quintic")
+        row.update(
+            {
+                "verifier_merkle_hashes": 2,
+                "verifier_row_field_elements": 3,
+                "verifier_extension_operations": 4,
+                "verifier_pow_checks": 5,
+            }
+        )
+        dump = {"schema_version": 2, "proof_mode": "no-zk", "candidates": [row]}
+
+        report = self.score_dump(dump, self.calibration(), max_pow_bits=22)
+
+        self.assertEqual(report["selected"]["verifier_projected_seconds"], 68.0)
+        self.assertEqual(
+            report["selected"]["verifier_cost_breakdown"]["merkle_hash"], 4.0
+        )
 
     def test_legacy_calibration_defaults_merkle_path_to_zero(self):
         calibration = self.calibration()
@@ -260,6 +291,36 @@ class PoseidonScheduleScorerTests(unittest.TestCase):
         }
         report = self.score_dump(dump, self.calibration(), max_pow_bits=22)
         self.assertEqual(report["selected"]["label"], "b")
+
+    def test_component_report_cap_preserves_three_axis_frontier(self):
+        dump = {
+            "schema_version": 1,
+            "proof_mode": "no-zk",
+            "component_security_override_bits": 120,
+            "candidates": [
+                candidate("fast-large", dft=1, proof_size_bytes=30),
+                candidate("verify", dft=2, proof_size_bytes=20),
+                candidate("small", dft=3, proof_size_bytes=10),
+                candidate("dominated", dft=4, proof_size_bytes=40),
+            ],
+        }
+        dump["candidates"][0]["verifier_merkle_hashes"] = 3
+        dump["candidates"][1]["verifier_merkle_hashes"] = 1
+        dump["candidates"][2]["verifier_merkle_hashes"] = 2
+        dump["candidates"][3]["verifier_merkle_hashes"] = 4
+
+        report = self.score_dump(
+            dump,
+            self.calibration(),
+            max_pow_bits=22,
+            max_report_rows=3,
+        )
+
+        self.assertEqual(
+            {row["label"] for row in report["scores"]},
+            {"fast-large", "verify", "small"},
+        )
+        self.assertEqual(report["candidate_retention"]["pareto_rows"], 3)
 
     def test_apply_case_metrics_updates_candidates(self):
         dump = {"schema_version": 1, "proof_mode": "no-zk", "candidates": [candidate("a")]}

@@ -46,6 +46,33 @@ pub trait MlePcs<E: SpartanWhirEngine> {
 pub trait ProtocolPcs<E: SpartanWhirEngine>: MlePcs<E> {
     type ParsedCommitment;
 
+    fn open_compressed(
+        config: &Self::Config,
+        prover_data: Self::ProverData,
+        statement: &PcsStatement<E>,
+        final_rows: bool,
+        challenger: &mut E::Challenger,
+    ) -> Result<Self::Proof, SpartanWhirError> {
+        if final_rows {
+            return Err(SpartanWhirError::InvalidProofShape);
+        }
+        Self::open(config, prover_data, statement, challenger)
+    }
+
+    fn verify_finalize_compressed(
+        config: &Self::Config,
+        parsed: &Self::ParsedCommitment,
+        statement: &PcsStatement<E>,
+        proof: &Self::Proof,
+        final_rows: bool,
+        challenger: &mut E::Challenger,
+    ) -> Result<(), SpartanWhirError> {
+        if final_rows {
+            return Err(SpartanWhirError::InvalidProofShape);
+        }
+        Self::verify_finalize(config, parsed, statement, proof, challenger)
+    }
+
     fn validate_spartan_config(
         config: &WhirPcsConfig,
         _matrix_closing: MatrixClosingMode,
@@ -89,6 +116,54 @@ pub trait ProtocolPcs<E: SpartanWhirEngine>: MlePcs<E> {
 pub trait SparkReadPcs<E: SpartanWhirEngine>: ProtocolPcs<E, Config = WhirPcsConfig> {
     type ReadProverData;
     type ParsedReadCommitment;
+
+    fn open_read_table_compressed(
+        config: &WhirPcsConfig,
+        prover_data: Self::ReadProverData,
+        column_count: usize,
+        opening_columns: &[Vec<usize>],
+        points: &[MultilinearPoint<E::EF>],
+        final_rows: bool,
+        challenger: &mut E::Challenger,
+    ) -> Result<(Self::Proof, Vec<Vec<E::EF>>), SpartanWhirError> {
+        if final_rows {
+            return Err(SpartanWhirError::InvalidProofShape);
+        }
+        Self::open_read_table(
+            config,
+            prover_data,
+            column_count,
+            opening_columns,
+            points,
+            challenger,
+        )
+    }
+
+    fn verify_finalize_read_table_compressed(
+        config: &WhirPcsConfig,
+        parsed: &Self::ParsedReadCommitment,
+        proof: &Self::Proof,
+        column_count: usize,
+        opening_columns: &[Vec<usize>],
+        points: &[MultilinearPoint<E::EF>],
+        evals: &[Vec<E::EF>],
+        final_rows: bool,
+        challenger: &mut E::Challenger,
+    ) -> Result<(), SpartanWhirError> {
+        if final_rows {
+            return Err(SpartanWhirError::InvalidProofShape);
+        }
+        Self::verify_finalize_read_table(
+            config,
+            parsed,
+            proof,
+            column_count,
+            opening_columns,
+            points,
+            evals,
+            challenger,
+        )
+    }
 
     fn commit_read_table(
         config: &WhirPcsConfig,

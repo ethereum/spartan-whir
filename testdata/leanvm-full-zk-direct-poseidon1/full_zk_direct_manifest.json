@@ -1,0 +1,118 @@
+{
+  "artifacts": {
+    "guest_constants": {
+      "bytes": 6633,
+      "file": "full_zk_direct_guest_constants.json",
+      "sha256": "9ad5af83aeb7a651eba29f57c3f42468becc74440907a3e4a0ceda31c1fd8ad2"
+    },
+    "guest_input": {
+      "bytes": 53524,
+      "file": "full_zk_direct_guest_input.words",
+      "sha256": "562f7c611d96168252ffa32c768f41f0b862bb42ce1443fe23e5b3363764feae"
+    },
+    "mutations": [
+      {
+        "bytes": 53524,
+        "file": "mutations/changed_public_input.words",
+        "sha256": "92d4be08346994f7fd3069229ce5f7bd34c6d6aaada9375eb1930f499d83e69f"
+      },
+      {
+        "bytes": 53524,
+        "file": "mutations/changed_witness_commitment.words",
+        "sha256": "dbc76e7472fc009ffff5c68d15d337a5d767a9dac02c810705e16d55812e2c42"
+      },
+      {
+        "bytes": 53524,
+        "file": "mutations/changed_application_mask_commitment.words",
+        "sha256": "12cf14f1c5cf0301b0a64bb7629b04a41b15aae1934a0ed998db977892ac1f83"
+      },
+      {
+        "bytes": 53524,
+        "file": "mutations/changed_outer_sumcheck.words",
+        "sha256": "cb2f9c8adc311d88e81ee6c8bc72fbd051ba48c801682eac9e629ff038cd6b3e"
+      },
+      {
+        "bytes": 53524,
+        "file": "mutations/changed_inner_sumcheck.words",
+        "sha256": "de51196a8fb20b58d5020c643a14fa40f57b5b382a13bdd12e9187e6a10c413d"
+      },
+      {
+        "bytes": 53524,
+        "file": "mutations/changed_hiding_whir_base_claim.words",
+        "sha256": "d8645af5816826cd553b82c17e3170b8a3afdb9de20ac335a5664bd21e7b9ad3"
+      }
+    ],
+    "statement": {
+      "bytes": 285,
+      "file": "full_zk_direct_statement.json",
+      "sha256": "92cc6c291d3364cb09837106732bf13fb442cac074ce460807eeb21212639432"
+    },
+    "transcript_trace": {
+      "bytes": 36291,
+      "file": "full_zk_direct_transcript_trace.json",
+      "sha256": "fb8a6627966120281513abc765d7826ab18851e90b1fb51b772ea01bc43674b3"
+    },
+    "verifying_key": {
+      "bytes": 4453,
+      "file": "full_zk_direct_verifying_key.json",
+      "sha256": "c1a48bcad78b65e117e8916443bfbdc10e00fb87634bc6b4edf627480bce4220"
+    }
+  },
+  "extension_degree": 5,
+  "fixture": {
+    "a_terms_per_constraint": 2,
+    "b_terms_per_constraint": 2,
+    "num_constraints": 4,
+    "num_io": 1,
+    "seed": 131549106474,
+    "target_log2_witness_poly": 3
+  },
+  "fixture_seed": 131549106474,
+  "guest_words": 13381,
+  "hash_profile": "poseidon1-width16",
+  "matrix_closing": "direct_sparse",
+  "proof_seed": 1031080120782,
+  "proof_shape": {
+    "base_case_blinded_masks": 13,
+    "base_case_blinded_message": 4,
+    "base_case_blinded_randomness": 18,
+    "base_case_mask_openings": 3,
+    "inner_round_widths": [
+      2,
+      2,
+      2,
+      2
+    ],
+    "inner_rounds": 4,
+    "outer_mask_evals": 2,
+    "outer_round_widths": [
+      7,
+      7
+    ],
+    "outer_rounds": 2,
+    "relation_ood_answers": [],
+    "relation_rounds": 0,
+    "relation_sumchecks": 1
+  },
+  "schema": "leanvm-full-zk-direct-fixture-v1",
+  "setup": {
+    "ell_zk": 3,
+    "mask_log_inv_rate": 3,
+    "matrix_closing": "DirectSparse",
+    "security": {
+      "merkle_security_bits": 80,
+      "security_level_bits": 80,
+      "soundness_assumption": "CapacityBound"
+    },
+    "spark_whir_params": null,
+    "whir_params": {
+      "folding_factor": 1,
+      "folding_schedule": null,
+      "pow_bits": 0,
+      "round_log_inv_rates": [],
+      "rs_domain_initial_reduction_factor": 1,
+      "starting_log_inv_rate": 8
+    }
+  },
+  "transcript_events": 397
+}

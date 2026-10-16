@@ -168,7 +168,7 @@ class SparkScheduleScorerTests(unittest.TestCase):
         result = self.compose()
         row = result["selected"]
 
-        self.assertEqual(result["schema_version"], 3)
+        self.assertEqual(result["schema_version"], 4)
         self.assertEqual(result["extension"], "quintic")
         self.assertEqual(result["component_num_variables"]["read"], [25, 23])
         self.assertEqual(row["component_labels"]["read"], ["r25", "r23"])
@@ -178,9 +178,13 @@ class SparkScheduleScorerTests(unittest.TestCase):
         self.assertEqual(row["component_scores"]["read"], 54.0)
         self.assertEqual(row["projected_schedule_seconds"], 68.0)
         self.assertEqual(row["proof_size_bytes_estimate"], 1200)
-        self.assertIsNone(result["candidate_retention"]["recursive_verifier_metric"])
-        self.assertFalse(
-            result["candidate_retention"]["recursive_verifier_used_for_ranking"]
+        self.assertEqual(
+            result["candidate_retention"]["recursive_verifier_metric"],
+            "calibrated native verifier wall time",
+        )
+        self.assertEqual(
+            result["candidate_retention"]["recursive_verifier_used_for_ranking"],
+            "tie_break_only",
         )
 
     def test_component_frontier_survives_top_per_component_limit(self):
@@ -1119,7 +1123,7 @@ class SparkScheduleScorerTests(unittest.TestCase):
         # leaving half the DFT cost and two thirds of the Merkle cost.
         self.assertAlmostEqual(score, 8.0 + 1.0 + 4.0 / 3.0)
 
-    def test_measured_selection_uses_overlapping_marginal_confidence_intervals(self):
+    def test_prover_confidence_interval_does_not_expand_one_percent_band(self):
         def row(label, proof_size, pow_bits):
             params = {"pow_bits": pow_bits}
             return {
@@ -1162,18 +1166,18 @@ class SparkScheduleScorerTests(unittest.TestCase):
 
         selected, summary = MODULE.measured_selection(rows, measurements)
 
-        self.assertEqual(selected["label"], "slow-small")
+        self.assertEqual(selected["label"], "fast")
         self.assertEqual(summary["paired_confidence_interval_role"], "diagnostic_only")
         self.assertEqual(
             [row["label"] for row in summary["tied_with_best"]],
-            ["fast", "slow-small"],
+            ["fast"],
         )
         self.assertEqual(
-            summary["tied_with_best"][1]["per_proof_component_pow_bits"],
-            {"witness": 2, "fixed_value": 2, "fixed_audit": 2, "read": 2},
+            summary["tied_with_best"][0]["per_proof_component_pow_bits"],
+            {"witness": 4, "fixed_value": 4, "fixed_audit": 4, "read": 4},
         )
         self.assertEqual(
-            summary["tied_with_best"][1]["heldout_proof_size_median_bytes"], 10
+            summary["tied_with_best"][0]["heldout_proof_size_median_bytes"], 20
         )
 
     def test_paired_confidence_interval_does_not_override_marginal_intervals(self):
@@ -1221,8 +1225,8 @@ class SparkScheduleScorerTests(unittest.TestCase):
             )
         )
 
-    def test_nearly_touching_marginal_intervals_are_tied(self):
-        self.assertTrue(
+    def test_nearly_touching_prover_intervals_do_not_expand_band(self):
+        self.assertFalse(
             MODULE.measurement_is_tied(
                 {
                     "measured_seconds": 1.1,
@@ -1264,6 +1268,102 @@ class SparkScheduleScorerTests(unittest.TestCase):
         selected = MODULE.select_measured(rows, measurements)
 
         self.assertEqual(selected["label"], "small")
+
+    def test_measured_selection_uses_single_thread_verifier_before_size(self):
+        rows = [
+            {"label": "small", "proof_size_bytes_estimate": 10},
+            {"label": "fast-verifier", "proof_size_bytes_estimate": 20},
+        ]
+        measurements = {
+            "rows": [
+                {
+                    "label": "small",
+                    "measured_seconds": 1.0,
+                    "heldout_median_ci_seconds": [0.99, 1.01],
+                    "heldout_proof_size_median_bytes": 10,
+                },
+                {
+                    "label": "fast-verifier",
+                    "measured_seconds": 1.005,
+                    "heldout_median_ci_seconds": [0.995, 1.015],
+                    "heldout_proof_size_median_bytes": 20,
+                },
+            ]
+        }
+        verifier_measurements = {
+            "rayon_threads": 1,
+            "rows": [
+                {"label": "small", "heldout_verify_seconds": 0.03},
+                {"label": "fast-verifier", "heldout_verify_seconds": 0.01},
+            ],
+        }
+
+        selected, summary = MODULE.measured_selection(
+            rows, measurements, verifier_measurements
+        )
+
+        self.assertEqual(selected["label"], "fast-verifier")
+        self.assertEqual(selected["heldout_verify_seconds"], 0.01)
+        self.assertEqual(summary["verifier_rayon_threads"], 1)
+
+    def test_measured_selection_uses_size_when_verifier_intervals_overlap(self):
+        rows = [
+            {"label": "small", "proof_size_bytes_estimate": 10},
+            {"label": "slightly-faster-verifier", "proof_size_bytes_estimate": 20},
+        ]
+        measurements = {
+            "rows": [
+                {
+                    "label": "small",
+                    "measured_seconds": 1.0,
+                    "heldout_proof_size_median_bytes": 10,
+                },
+                {
+                    "label": "slightly-faster-verifier",
+                    "measured_seconds": 1.005,
+                    "heldout_proof_size_median_bytes": 20,
+                },
+            ]
+        }
+        verifier_measurements = {
+            "rayon_threads": 1,
+            "rows": [
+                {
+                    "label": "small",
+                    "heldout_verify_seconds": 0.0101,
+                    "heldout_verify_median_ci_seconds": [0.0098, 0.0104],
+                },
+                {
+                    "label": "slightly-faster-verifier",
+                    "heldout_verify_seconds": 0.01,
+                    "heldout_verify_median_ci_seconds": [0.0097, 0.0103],
+                },
+            ],
+        }
+
+        selected, summary = MODULE.measured_selection(
+            rows, measurements, verifier_measurements
+        )
+
+        self.assertEqual(selected["label"], "small")
+        self.assertEqual(summary["verifier_tied_count"], 2)
+
+    def test_three_axis_frontier_retains_lower_verifier_work(self):
+        rows = [
+            {"label": "small", "time": 1.0, "verifier": 3.0, "size": 10},
+            {"label": "verify", "time": 1.0, "verifier": 1.0, "size": 20},
+            {"label": "dominated", "time": 2.0, "verifier": 4.0, "size": 30},
+        ]
+
+        frontier = MODULE.pareto_rows_3d(
+            rows,
+            lambda row: row["time"],
+            lambda row: row["verifier"],
+            lambda row: row["size"],
+            lambda row: row["label"],
+        )
+
+        self.assertEqual({row["label"] for row in frontier}, {"small", "verify"})
 
 
 if __name__ == "__main__":

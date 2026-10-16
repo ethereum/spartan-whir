@@ -33,6 +33,14 @@ COMPONENTS = (
     ("pow", "pow_work_units"),
 )
 
+VERIFIER_COMPONENTS = (
+    ("merkle_hash", "verifier_merkle_hashes"),
+    ("leaf_field_element", "verifier_leaf_field_elements"),
+    ("row_field_element", "verifier_row_field_elements"),
+    ("extension_operation", "verifier_extension_operations"),
+    ("pow_check", "verifier_pow_checks"),
+)
+
 
 def main() -> None:
     parser = argparse.ArgumentParser()
@@ -245,6 +253,7 @@ def score_dump(
     if proof_mode not in ("no-zk", "full-zk"):
         raise SystemExit("candidate dump must declare proof_mode as no-zk or full-zk")
     coeffs = normalized_coefficients(calibration)
+    verifier_coeffs = normalized_verifier_coefficients(calibration, coeffs)
     validation = validate_model(calibration, coeffs, proof_mode)
     require_row_proof_modes(dump.get("candidates", []), proof_mode, "candidate")
     if measurements is not None and measurements.get("proof_mode") != proof_mode:
@@ -269,6 +278,12 @@ def score_dump(
         projected = projected_seconds(candidate, coeffs, use_zk_metrics)
         row["projected_seconds"] = projected
         row["cost_breakdown"] = cost_breakdown(candidate, coeffs, use_zk_metrics)
+        row["verifier_projected_seconds"] = verifier_projected_seconds(
+            candidate, verifier_coeffs, use_zk_metrics
+        )
+        row["verifier_cost_breakdown"] = verifier_cost_breakdown(
+            candidate, verifier_coeffs, use_zk_metrics
+        )
         row["accepted_for_ranking"] = not rejection_reasons
         row["rejection_reasons"] = rejection_reasons
         scored.append(row)
@@ -317,11 +332,53 @@ def score_dump(
             str(row.get("label") or ""),
         ),
     )
+    retention = None
+    if max_report_rows is not None and component_search:
+        frontier = pareto_rows_3d(
+            accepted,
+            lambda row: row["projected_seconds"],
+            lambda row: row["verifier_projected_seconds"],
+            lambda row: row.get("proof_size_bytes_estimate") or 0,
+        )
+        required = unique_rows(
+            [
+                *frontier,
+                *measurement_shortlist,
+                *([selected] if selected is not None else []),
+            ]
+        )
+        if len(required) > max_report_rows:
+            raise SystemExit(
+                "--max-report-rows is too small for the component verifier/proof-size "
+                f"frontier and required rows: need at least {len(required)}"
+            )
+        required_keys = {measurement_shortlist_key(row) for row in required}
+        fill = [
+            row
+            for row in sorted_scores
+            if measurement_shortlist_key(row) not in required_keys
+        ][: max_report_rows - len(required)]
+        sorted_scores = unique_rows([*required, *fill])
+        sorted_scores.sort(
+            key=lambda row: (
+                not row["accepted_for_ranking"],
+                float(row["projected_seconds"]),
+                pow_tie_break_key(row),
+                str(row.get("label") or ""),
+            )
+        )
+        retention = {
+            "policy": "complete verifier/proof-size Pareto frontier plus measurement and selected rows",
+            "accepted_rows": len(accepted),
+            "pareto_rows": len(frontier),
+            "required_rows": len(required),
+            "stored_rows": len(sorted_scores),
+        }
     if max_report_rows is not None:
         sorted_scores = sorted_scores[:max_report_rows]
 
     return {
-        "schema_version": 1,
+        "schema_version": 3,
         "provenance": dump.get("provenance"),
         "source_provenance": {
             "candidates": dump.get("provenance"),
@@ -350,13 +407,89 @@ def score_dump(
         "proof_mode": proof_mode,
         "model_validation": validation,
         "coefficients": coeffs,
+        "verifier_coefficients": verifier_coeffs,
         "selected": selected,
         "selected_measured": selected_measured,
         "measurement_summary": measurement_summary,
         "measurement_shortlist": measurement_shortlist,
         "measurement_shortlist_meta": shortlist_meta,
+        "candidate_retention": retention,
         "scores": sorted_scores,
     }
+
+
+def unique_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    selected = []
+    seen = set()
+    for row in rows:
+        key = measurement_shortlist_key(row)
+        if key in seen:
+            continue
+        seen.add(key)
+        selected.append(row)
+    return selected
+
+
+def pareto_rows_3d(
+    rows: list[dict[str, Any]],
+    time_value,
+    verifier_value,
+    size_value,
+) -> list[dict[str, Any]]:
+    ordered = sorted(
+        rows,
+        key=lambda row: (
+            float(time_value(row)),
+            float(verifier_value(row)),
+            int(size_value(row)),
+            str(row.get("label") or ""),
+        ),
+    )
+    selected = []
+    seen_configurations = set()
+    verifier_values = sorted({float(verifier_value(row)) for row in ordered})
+    verifier_indexes = {value: index + 1 for index, value in enumerate(verifier_values)}
+    prefix_minima: list[tuple[int, float, float] | None] = [None] * (
+        len(verifier_values) + 1
+    )
+
+    def prefix_min(index: int) -> tuple[int, float, float] | None:
+        best = None
+        while index > 0:
+            candidate = prefix_minima[index]
+            if candidate is not None and (best is None or candidate < best):
+                best = candidate
+            index -= index & -index
+        return best
+
+    def update(index: int, value: tuple[int, float, float]) -> None:
+        while index < len(prefix_minima):
+            current = prefix_minima[index]
+            if current is None or value < current:
+                prefix_minima[index] = value
+            index += index & -index
+
+    for row in ordered:
+        identity = measurement_shortlist_key(row)
+        if identity in seen_configurations:
+            continue
+        seen_configurations.add(identity)
+        objective = (
+            float(time_value(row)),
+            float(verifier_value(row)),
+            int(size_value(row)),
+        )
+        verifier_index = verifier_indexes[objective[1]]
+        prior = prefix_min(verifier_index)
+        dominated = prior is not None and prior[0] <= objective[2] and (
+            prior[0] < objective[2]
+            or prior[1] < objective[0]
+            or prior[2] < objective[1]
+        )
+        if not dominated:
+            selected.append(row)
+        update(verifier_index, (objective[2], objective[0], objective[1]))
+    return selected
 
 
 def normalized_coefficients(calibration: dict[str, Any]) -> dict[str, Any]:
@@ -378,6 +511,94 @@ def normalized_coefficients(calibration: dict[str, Any]) -> dict[str, Any]:
         else:
             coeffs[name] = float(source[name])
     return coeffs
+
+
+def normalized_verifier_coefficients(
+    calibration: dict[str, Any], prover_coeffs: dict[str, Any]
+) -> dict[str, Any]:
+    source = calibration.get("verifier_coefficients")
+    if source is None:
+        return {
+            "fixed_overhead": 0.0,
+            "merkle_hash": float(prover_coeffs.get("merkle_path", 0.0)),
+            "leaf_field_element": float(prover_coeffs.get("merkle_path", 0.0)),
+            "row_field_element": float(prover_coeffs.get("row_opening", 0.0)),
+            "extension_operation": prover_coeffs.get("sumcheck", {}),
+            "pow_check": float(prover_coeffs.get("pow", 0.0)),
+            "source": "legacy_prover_coefficients",
+        }
+    if not isinstance(source, dict):
+        raise SystemExit("calibration verifier_coefficients must be an object")
+    required = (
+        "merkle_hash",
+        "leaf_field_element",
+        "row_field_element",
+        "extension_operation",
+        "pow_check",
+    )
+    missing = [name for name in required if name not in source]
+    if missing:
+        raise SystemExit(
+            "calibration missing verifier coefficient " + ", ".join(missing)
+        )
+    extension = source["extension_operation"]
+    if not isinstance(extension, dict):
+        raise SystemExit("verifier extension_operation coefficient must be an object")
+    return {
+        "fixed_overhead": float(source.get("fixed_overhead", 0.0)),
+        "merkle_hash": float(source["merkle_hash"]),
+        "leaf_field_element": float(source["leaf_field_element"]),
+        "row_field_element": float(source["row_field_element"]),
+        "extension_operation": {
+            key: float(value) for key, value in extension.items()
+        },
+        "pow_check": float(source["pow_check"]),
+        "source": "verifier_component_calibration",
+    }
+
+
+def verifier_projected_seconds(
+    candidate: dict[str, Any],
+    coeffs: dict[str, Any],
+    use_zk_metrics: bool = False,
+) -> float:
+    return sum(
+        verifier_component_seconds(candidate, coeffs, name, metric, use_zk_metrics)
+        for name, metric in VERIFIER_COMPONENTS
+    ) + float(coeffs["fixed_overhead"])
+
+
+def verifier_cost_breakdown(
+    candidate: dict[str, Any],
+    coeffs: dict[str, Any],
+    use_zk_metrics: bool = False,
+) -> dict[str, float]:
+    out = {"fixed_overhead": float(coeffs["fixed_overhead"])}
+    for name, metric in VERIFIER_COMPONENTS:
+        out[name] = verifier_component_seconds(
+            candidate, coeffs, name, metric, use_zk_metrics
+        )
+    return out
+
+
+def verifier_component_seconds(
+    candidate: dict[str, Any],
+    coeffs: dict[str, Any],
+    name: str,
+    metric: str,
+    use_zk_metrics: bool,
+) -> float:
+    metric_name = f"zk_{metric}" if use_zk_metrics else metric
+    work = float(candidate.get(metric_name) or candidate.get(metric) or 0.0)
+    coefficient = coeffs[name]
+    if isinstance(coefficient, dict):
+        extension = candidate.get("extension")
+        if extension not in coefficient:
+            raise SystemExit(
+                f"missing verifier {name} coefficient for extension {extension}"
+            )
+        coefficient = coefficient[extension]
+    return work * float(coefficient)
 
 
 def projected_seconds(

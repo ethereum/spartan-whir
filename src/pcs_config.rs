@@ -23,11 +23,50 @@ impl Default for WhirPcsConfig {
     }
 }
 
+pub use p3_whir::pcs::zk::FreshMaskBatching;
+
+/// Physical representation of independent full-ZK masking polynomials.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MaskPacking {
+    #[default]
+    Off,
+    Application,
+    All,
+    ApplicationFreeBasis,
+    AllFreeBasis,
+}
+
+impl MaskPacking {
+    pub const fn application(self) -> bool {
+        !matches!(self, Self::Off)
+    }
+    pub const fn sumchecks(self) -> bool {
+        matches!(self, Self::All | Self::AllFreeBasis)
+    }
+    pub const fn free_basis(self) -> bool {
+        matches!(self, Self::ApplicationFreeBasis | Self::AllFreeBasis)
+    }
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Application => "application",
+            Self::All => "all",
+            Self::ApplicationFreeBasis => "application_free_basis",
+            Self::AllFreeBasis => "all_free_basis",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ZkWhirPcsConfig {
     pub base: WhirPcsConfig,
     pub ell_zk: usize,
     pub mask_log_inv_rate: usize,
+    #[serde(default)]
+    pub fresh_mask_batching: FreshMaskBatching,
+    #[serde(default)]
+    pub mask_packing: MaskPacking,
 }
 
 impl Default for ZkWhirPcsConfig {
@@ -36,6 +75,8 @@ impl Default for ZkWhirPcsConfig {
             base: WhirPcsConfig::default(),
             ell_zk: DEFAULT_ZK_ELL,
             mask_log_inv_rate: DEFAULT_ZK_MASK_LOG_INV_RATE,
+            fresh_mask_batching: FreshMaskBatching::Separate,
+            mask_packing: MaskPacking::Off,
         }
     }
 }

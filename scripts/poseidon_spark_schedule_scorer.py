@@ -14,6 +14,8 @@ from typing import Any
 FIXED_VALUE_COLUMN_BITS = 3
 FIXED_AUDIT_COLUMN_BITS = 1
 SPARK_COMPONENT_TARGETS = {(116, 116): (120, 123)}
+PROVER_SELECTION_BAND_RELATIVE = 0.01
+VERIFIER_SELECTION_BAND_RELATIVE = 0.01
 
 
 def main() -> None:
@@ -42,6 +44,13 @@ def main() -> None:
     parser.add_argument("--workload-r1cs", required=True)
     parser.add_argument("--workload-label", required=True)
     parser.add_argument("--measurements")
+    parser.add_argument(
+        "--verifier-measurements",
+        help=(
+            "Heldout report used for verifier calibration and tie-breaking; "
+            "run it with RAYON_NUM_THREADS=1"
+        ),
+    )
     parser.add_argument("--reference-witness-label")
     parser.add_argument("--reference-fixed-value-label")
     parser.add_argument("--reference-fixed-audit-label")
@@ -84,6 +93,11 @@ def main() -> None:
         workload_identity=workload_identity_from_r1cs(
             Path(args.workload_r1cs), args.workload_label
         ),
+        verifier_measurements=(
+            read_json(args.verifier_measurements)
+            if args.verifier_measurements
+            else None
+        ),
     )
     write_json(args.out_report, report)
     selected = report.get("selected_measured") or report["selected"]
@@ -91,6 +105,7 @@ def main() -> None:
         "selected "
         f"label={selected['label']} "
         f"projected_seconds={selected['projected_seconds']:.9g} "
+        f"verifier_projected_seconds={selected.get('verifier_projected_seconds', 0.0):.9g} "
         f"proof_size_bytes_estimate={selected['proof_size_bytes_estimate']}"
     )
 
@@ -111,6 +126,7 @@ def compose_report(
     proof_mode: str = "full-zk",
     fixed_audit_embedded: bool = False,
     workload_identity: dict[str, Any] | None = None,
+    verifier_measurements: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     if min(top_per_component, max_report_rows, measurement_rows) <= 0:
         raise SystemExit("row limits must be positive")
@@ -143,6 +159,14 @@ def compose_report(
         require_matching_measurement_context(
             measurements, provenance, proof_mode, workload_identity
         )
+    if verifier_measurements is not None:
+        require_matching_measurement_context(
+            verifier_measurements, provenance, proof_mode, workload_identity
+        )
+        if verifier_measurements.get("rayon_threads") != 1:
+            raise SystemExit(
+                "verifier measurements must record rayon_threads=1"
+            )
     reference_labels = normalize_reference_labels(
         reference_labels or {}, len(read_reports)
     )
@@ -167,6 +191,13 @@ def compose_report(
         extension,
         component_security_bits,
         component_merkle_security_bits,
+    )
+    band_candidates, prover_band = prover_selection_band(
+        all_candidates, fixed_audit_embedded
+    )
+    verifier_objective_available = all(
+        isinstance(report.get("verifier_coefficients"), dict)
+        for _, report in named_reports(reports)
     )
     component_frontiers = {
         component: component_pareto_rows(
@@ -196,6 +227,7 @@ def compose_report(
         extension,
         fixed_audit_embedded,
         None,
+        PROVER_SELECTION_BAND_RELATIVE if verifier_objective_available else None,
     )
     if not rows:
         raise SystemExit(f"no valid {extension} schedule combinations")
@@ -222,6 +254,11 @@ def compose_report(
         measured_candidate_rows = require_measurement_rows_match_candidates(
             measurements, measurement_candidates, workload_identity
         )
+    verifier_candidate_rows = []
+    if verifier_measurements is not None:
+        verifier_candidate_rows = require_measurement_rows_match_candidates(
+            verifier_measurements, measurement_candidates, workload_identity
+        )
 
     calibration = calibrate(
         measurement_candidates,
@@ -240,12 +277,25 @@ def compose_report(
             extension,
             fixed_audit_embedded,
             calibration,
+            PROVER_SELECTION_BAND_RELATIVE if verifier_objective_available else None,
         )
         attach_workload_identity(rows, workload_identity)
         apply_calibration(shortlist, calibration, fixed_audit_embedded)
         apply_calibration(measured_candidate_rows, calibration, fixed_audit_embedded)
+        apply_calibration(verifier_candidate_rows, calibration, fixed_audit_embedded)
+    verifier_calibration = calibrate_verifier(
+        measurement_candidates,
+        verifier_measurements or measurements,
+    )
+    if verifier_calibration is not None:
+        apply_verifier_calibration(rows, verifier_calibration)
+        apply_verifier_calibration(shortlist, verifier_calibration)
+        apply_verifier_calibration(measured_candidate_rows, verifier_calibration)
+        apply_verifier_calibration(verifier_candidate_rows, verifier_calibration)
     composed_frontier_count = len(rows)
-    rows = required_report_rows(rows, shortlist, measured_candidate_rows)
+    rows = required_report_rows(
+        rows, shortlist, [*measured_candidate_rows, *verifier_candidate_rows]
+    )
     if len(rows) > max_report_rows:
         raise SystemExit(
             f"{len(rows)} Pareto, shortlist, and measured rows exceed "
@@ -253,9 +303,11 @@ def compose_report(
         )
     rows.sort(key=ranking_key)
 
-    selected_measured, measurement_summary = measured_selection(rows, measurements)
+    selected_measured, measurement_summary = measured_selection(
+        rows, measurements, verifier_measurements
+    )
     return {
-        "schema_version": 3,
+        "schema_version": 4,
         "provenance": provenance,
         "workload_identity": workload_identity,
         "matrix_closing": "Spark",
@@ -281,14 +333,17 @@ def compose_report(
             "read_report_count": len(read_reports),
             "fixed_setup_log_domain_caps": fixed_setup_log_domain_caps,
             "calibration": calibration,
+            "verifier_calibration": verifier_calibration,
         },
         "candidate_retention": candidate_retention_metadata(
             all_candidates,
+            band_candidates,
             component_frontiers,
             composed_frontier_count,
             len(rows),
             top_per_component,
             fixed_audit_embedded,
+            prover_band,
         ),
         "selected": rows[0],
         "selected_measured": selected_measured,
@@ -341,6 +396,12 @@ def require_matching_coefficients(reports: dict[str, Any]) -> None:
         raise SystemExit("component reports must carry calibration coefficients")
     if any(value != first for value in coefficients[1:]):
         raise SystemExit("component reports use different calibration coefficients")
+    verifier_coefficients = [
+        report.get("verifier_coefficients") for _, report in named_reports(reports)
+    ]
+    verifier_first = verifier_coefficients[0]
+    if any(value != verifier_first for value in verifier_coefficients[1:]):
+        raise SystemExit("component reports use different verifier calibration coefficients")
 
 
 def workload_identity_from_r1cs(path: Path, label: str) -> dict[str, Any]:
@@ -390,21 +451,27 @@ def required_report_rows(
 
 def candidate_retention_metadata(
     all_candidates: dict[str, list[dict[str, Any]]],
+    band_candidates: dict[str, list[dict[str, Any]]],
     component_frontiers: dict[str, list[dict[str, Any]]],
     composed_frontier_count: int,
     required_report_row_count: int,
     top_per_component: int,
     fixed_audit_embedded: bool,
+    prover_band: dict[str, Any],
 ) -> dict[str, Any]:
     components = {}
     for component in ("witness", "fixed_value", "fixed_audit", "read"):
         frontier = component_frontiers[component]
         components[component] = {
             "eligible_rows": len(all_candidates[component]),
+            "rows_within_prover_selection_band": len(band_candidates[component]),
             "pareto_objective_points": len(
                 {
                     (
                         component_score(row, component, fixed_audit_embedded),
+                        component_verifier_score(
+                            row, component, fixed_audit_embedded
+                        ),
                         component_proof_size(row, component, fixed_audit_embedded),
                     )
                     for row in frontier
@@ -413,18 +480,52 @@ def candidate_retention_metadata(
             "pareto_rows": len(frontier),
         }
     return {
-        "component_objectives": ["component_score", "component_proof_size"],
+        "component_objectives": [
+            "component_score",
+            "component_verifier_score",
+            "component_proof_size",
+        ],
         "composed_objectives": [
             "projected_seconds",
+            "verifier_projected_seconds",
             "proof_size_bytes_estimate",
         ],
         "top_per_component": top_per_component,
         "top_per_component_scope": "measurement_shortlist",
-        "recursive_verifier_metric": None,
-        "recursive_verifier_used_for_ranking": False,
+        "prover_selection_band": prover_band,
+        "recursive_verifier_metric": "calibrated native verifier wall time",
+        "recursive_verifier_used_for_ranking": "tie_break_only",
         "components": components,
         "composed_pareto_rows": composed_frontier_count,
         "required_report_rows": required_report_row_count,
+    }
+
+
+def prover_selection_band(
+    candidates: dict[str, list[dict[str, Any]]], fixed_audit_embedded: bool
+) -> tuple[dict[str, list[dict[str, Any]]], dict[str, Any]]:
+    minima = {
+        component: min(
+            component_score(row, component, fixed_audit_embedded) for row in rows
+        )
+        for component, rows in candidates.items()
+    }
+    best_total = sum(minima.values())
+    margin = best_total * PROVER_SELECTION_BAND_RELATIVE
+    retained = {
+        component: [
+            row
+            for row in rows
+            if component_score(row, component, fixed_audit_embedded)
+            <= minima[component] + margin + 1e-12
+        ]
+        for component, rows in candidates.items()
+    }
+    return retained, {
+        "policy": "component excess bounded by one percent of the best composed prover projection",
+        "relative_margin": PROVER_SELECTION_BAND_RELATIVE,
+        "best_composed_projected_seconds": best_total,
+        "margin_seconds": margin,
     }
 
 
@@ -789,9 +890,10 @@ def component_pareto_rows(
     component: str,
     fixed_audit_embedded: bool,
 ) -> list[dict[str, Any]]:
-    return pareto_rows(
+    return pareto_rows_3d(
         rows,
         lambda row: component_score(row, component, fixed_audit_embedded),
+        lambda row: component_verifier_score(row, component, fixed_audit_embedded),
         lambda row: component_proof_size(row, component, fixed_audit_embedded),
         lambda row: json.dumps(row["whir_params"], sort_keys=True, separators=(",", ":")),
     )
@@ -828,6 +930,71 @@ def pareto_rows(
             best_time_for_size = time
         elif size == best_size and time == best_time_for_size:
             selected.append(row)
+    return selected
+
+
+def pareto_rows_3d(
+    rows: list[dict[str, Any]],
+    time_value,
+    verifier_value,
+    size_value,
+    configuration_identity,
+) -> list[dict[str, Any]]:
+    ordered = sorted(
+        rows,
+        key=lambda row: (
+            float(time_value(row)),
+            float(verifier_value(row)),
+            int(size_value(row)),
+            str(row.get("label") or ""),
+        ),
+    )
+    selected = []
+    seen_configurations = set()
+    verifier_values = sorted({float(verifier_value(row)) for row in ordered})
+    verifier_indexes = {value: index + 1 for index, value in enumerate(verifier_values)}
+    # Fenwick prefix minima over verifier work. Each entry stores
+    # (proof size, prover time, verifier work) for the best prior point.
+    prefix_minima: list[tuple[int, float, float] | None] = [None] * (
+        len(verifier_values) + 1
+    )
+
+    def prefix_min(index: int) -> tuple[int, float, float] | None:
+        best = None
+        while index > 0:
+            candidate = prefix_minima[index]
+            if candidate is not None and (best is None or candidate < best):
+                best = candidate
+            index -= index & -index
+        return best
+
+    def update(index: int, value: tuple[int, float, float]) -> None:
+        while index < len(prefix_minima):
+            current = prefix_minima[index]
+            if current is None or value < current:
+                prefix_minima[index] = value
+            index += index & -index
+
+    for row in ordered:
+        identity = configuration_identity(row)
+        if identity in seen_configurations:
+            continue
+        seen_configurations.add(identity)
+        objective = (
+            float(time_value(row)),
+            float(verifier_value(row)),
+            int(size_value(row)),
+        )
+        verifier_index = verifier_indexes[objective[1]]
+        prior = prefix_min(verifier_index)
+        dominated = prior is not None and prior[0] <= objective[2] and (
+            prior[0] < objective[2]
+            or prior[1] < objective[0]
+            or prior[2] < objective[1]
+        )
+        if not dominated:
+            selected.append(row)
+        update(verifier_index, (objective[2], objective[0], objective[1]))
     return selected
 
 
@@ -874,9 +1041,29 @@ def composed_pareto_rows(
     extension: str,
     fixed_audit_embedded: bool,
     calibration: dict[str, Any] | None,
+    prover_band_relative: float | None = None,
 ) -> list[dict[str, Any]]:
-    partials = [{"choices": {}, "time": 0.0, "size": 0}]
-    for component in ("witness", "fixed_value", "fixed_audit", "read"):
+    component_order = ("witness", "fixed_value", "fixed_audit", "read")
+    component_minima = {
+        component: min(
+            calibrated_component_score(
+                candidate, component, fixed_audit_embedded, calibration
+            )
+            for candidate in components[component]
+        )
+        for component in component_order
+    }
+    best_total = sum(component_minima.values())
+    cutoff = (
+        best_total * (1.0 + prover_band_relative)
+        if prover_band_relative is not None
+        else float("inf")
+    )
+    partials = [{"choices": {}, "time": 0.0, "verifier": 0.0, "size": 0}]
+    for component_index, component in enumerate(component_order):
+        remaining_minimum = sum(
+            component_minima[name] for name in component_order[component_index + 1 :]
+        )
         expanded = []
         for partial in partials:
             for candidate in components[component]:
@@ -890,15 +1077,25 @@ def composed_pareto_rows(
                             fixed_audit_embedded,
                             calibration,
                         ),
+                        "verifier": float(partial["verifier"])
+                        + component_verifier_score(
+                            candidate, component, fixed_audit_embedded
+                        ),
                         "size": int(partial["size"])
                         + component_proof_size(
                             candidate, component, fixed_audit_embedded
                         ),
                     }
                 )
-        partials = pareto_rows(
+        expanded = [
+            partial
+            for partial in expanded
+            if float(partial["time"]) + remaining_minimum <= cutoff + 1e-12
+        ]
+        partials = pareto_rows_3d(
             expanded,
             lambda partial: partial["time"],
+            lambda partial: partial["verifier"],
             lambda partial: partial["size"],
             partial_configuration_identity,
         )
@@ -923,9 +1120,10 @@ def composed_pareto_rows(
     rows = deduplicate_rows(rows)
     if calibration is not None:
         apply_calibration(rows, calibration, fixed_audit_embedded)
-    return pareto_rows(
+    return pareto_rows_3d(
         rows,
         lambda row: row["projected_seconds"],
+        lambda row: row["verifier_projected_seconds"],
         proof_size,
         lambda row: json.dumps(row["setup_config"], sort_keys=True, separators=(",", ":")),
     )
@@ -994,10 +1192,12 @@ def shared_read_rows(
             current = by_params.get(key)
             if current is None or (
                 component_score(candidate, "read"),
+                component_verifier_score(candidate, "read"),
                 proof_size(candidate),
                 str(candidate["label"]),
             ) < (
                 component_score(current, "read"),
+                component_verifier_score(current, "read"),
                 proof_size(current),
                 str(current["label"]),
             ):
@@ -1026,6 +1226,9 @@ def shared_read_rows(
                 "_component_score": sum(
                     component_score(row, "read") for row in source_rows
                 ),
+                "_component_verifier_score": sum(
+                    component_verifier_score(row, "read") for row in source_rows
+                ),
                 "_source_labels": labels,
                 "_component_num_variables": [
                     report.get("num_variables") for report in reports
@@ -1035,6 +1238,7 @@ def shared_read_rows(
     shared.sort(
         key=lambda row: (
             component_score(row, "read"),
+            component_verifier_score(row, "read"),
             proof_size(row),
             str(row["label"]),
         )
@@ -1198,6 +1402,16 @@ def component_score(
     return score
 
 
+def component_verifier_score(
+    row: dict[str, Any], component: str, fixed_audit_embedded: bool = False
+) -> float:
+    if component == "fixed_audit" and fixed_audit_embedded:
+        return 0.0
+    if component == "read" and row.get("_component_verifier_score") is not None:
+        return float(row["_component_verifier_score"])
+    return float(row.get("verifier_projected_seconds") or 0.0)
+
+
 def component_proof_size(
     row: dict[str, Any], component: str, fixed_audit_embedded: bool = False
 ) -> int:
@@ -1247,7 +1461,12 @@ def composed_row(
         component: component_score(row, component, fixed_audit_embedded)
         for component, row in components.items()
     }
+    verifier_scores = {
+        component: component_verifier_score(row, component, fixed_audit_embedded)
+        for component, row in components.items()
+    }
     projected = sum(scores.values())
+    verifier_projected = sum(verifier_scores.values())
     size = sum(
         component_proof_size(row, component, fixed_audit_embedded)
         for component, row in components.items()
@@ -1294,9 +1513,11 @@ def composed_row(
         "matrix_closing": "Spark",
         "projected_schedule_seconds": projected,
         "projected_seconds": projected,
+        "verifier_projected_seconds": verifier_projected,
         "proof_size_bytes_estimate": size,
         "component_labels": labels,
         "component_scores": scores,
+        "component_verifier_scores": verifier_scores,
         "fixed_audit_embedded": fixed_audit_embedded,
         "setup_config": setup_config,
     }
@@ -1490,8 +1711,92 @@ def apply_calibration(
         row["projected_seconds"] = intercept + scale * float(row["projected_schedule_seconds"])
 
 
-def measured_selection(
+def calibrate_verifier(
     rows: list[dict[str, Any]], measurements: dict[str, Any] | None
+) -> dict[str, Any] | None:
+    if measurements is None:
+        return None
+    measured = {
+        str(row["label"]): float(row["heldout_verify_seconds"])
+        for row in measurements.get("rows", [])
+        if row.get("heldout_verify_seconds") is not None
+    }
+    rows_by_label = {str(row["label"]): row for row in rows}
+    pairs = []
+    for measured_row in measurements.get("rows", []):
+        label = str(measured_row.get("label") or "")
+        row = rows_by_label.get(label)
+        if row is None or label not in measured:
+            continue
+        projected = float(row.get("verifier_projected_seconds") or 0.0)
+        if projected > 0.0:
+            pairs.append((projected, measured[label]))
+    if not pairs:
+        return None
+    if len(pairs) >= 4:
+        calibration_pairs = pairs[::2]
+        validation_pairs = pairs[1::2]
+    else:
+        calibration_pairs = pairs
+        validation_pairs = []
+    if len(calibration_pairs) == 1:
+        intercept, scale = (
+            0.0,
+            calibration_pairs[0][1] / calibration_pairs[0][0],
+        )
+        method = "single-point scale"
+    else:
+        intercept, scale = fit_affine(calibration_pairs)
+        method = "affine fit over measured verifier rows"
+        if scale <= 0.0:
+            ratios = sorted(
+                measured_value / projected
+                for projected, measured_value in calibration_pairs
+            )
+            intercept, scale = 0.0, ratios[len(ratios) // 2]
+            method = "median scale because affine slope was non-positive"
+    calibration_errors = [
+        relative_error(intercept + scale * projected, measured_value)
+        for projected, measured_value in calibration_pairs
+    ]
+    validation_errors = [
+        relative_error(intercept + scale * projected, measured_value)
+        for projected, measured_value in validation_pairs
+    ]
+    return {
+        "method": method,
+        "measurement": "native wall time",
+        "rayon_threads": measurements.get("rayon_threads"),
+        "source_measurements": measurements.get("source_report"),
+        "rows": len(pairs),
+        "calibration_rows": len(calibration_pairs),
+        "validation_rows": len(validation_pairs),
+        "intercept_seconds": intercept,
+        "scale": scale,
+        "calibration_max_relative_error": max(calibration_errors),
+        "validation_max_relative_error": (
+            max(validation_errors) if validation_errors else None
+        ),
+        "validation_within_twenty_percent": bool(validation_errors)
+        and max(validation_errors) <= 0.20,
+    }
+
+
+def apply_verifier_calibration(
+    rows: list[dict[str, Any]], calibration: dict[str, Any]
+) -> None:
+    intercept = float(calibration["intercept_seconds"])
+    scale = float(calibration["scale"])
+    for row in rows:
+        component_projection = float(row.get("verifier_projected_seconds") or 0.0)
+        row["verifier_component_projection_seconds"] = component_projection
+        row["verifier_projected_seconds"] = intercept + scale * component_projection
+
+
+def measured_selection(
+    rows: list[dict[str, Any]],
+    measurements: dict[str, Any] | None,
+    verifier_measurements: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
     if measurements is None:
         return None, None
@@ -1499,6 +1804,12 @@ def measured_selection(
         row["label"]: row
         for row in measurements.get("rows", [])
         if row.get("measured_seconds") is not None
+    }
+    verifier_source = verifier_measurements or measurements
+    verifier_rows = {
+        row["label"]: row
+        for row in (verifier_source or {}).get("rows", [])
+        if row.get("heldout_verify_seconds") is not None
     }
     candidates = [row for row in rows if row["label"] in measured_rows]
     if not candidates:
@@ -1521,7 +1832,23 @@ def measured_selection(
         for row in candidates
         if measurement_is_tied(measured_rows[row["label"]], fastest_measurement)
     ]
-    selected = min(tied, key=lambda row: (measured_size(measured_rows[row["label"]]), row["label"]))
+    fastest_verifier = min(tied, key=lambda row: verifier_seconds(row, verifier_rows))
+    verifier_tied = [
+        row
+        for row in tied
+        if verifier_measurement_is_tied(
+            row,
+            fastest_verifier,
+            verifier_rows,
+        )
+    ]
+    selected = min(
+        verifier_tied,
+        key=lambda row: (
+            measured_size(measured_rows[row["label"]]),
+            row["label"],
+        ),
+    )
     out = dict(selected)
     out.update(
         {
@@ -1532,6 +1859,9 @@ def measured_selection(
             "heldout_proof_size_median_bytes": measured_size(
                 measured_rows[selected["label"]]
             ),
+            "heldout_verify_seconds": verifier_rows.get(selected["label"], {}).get(
+                "heldout_verify_seconds"
+            ),
         }
     )
     tied_details = [
@@ -1540,17 +1870,31 @@ def measured_selection(
             measured_rows[row["label"]],
             fastest_measurement,
             candidates.index(row) + 1,
+            verifier_rows.get(row["label"]),
         )
         for row in tied
     ]
+    verifier_tied_labels = {row["label"] for row in verifier_tied}
     return out, {
         "source_measurements": measurements.get("source_report"),
         "measured_rows": len(candidates),
-        "selection": "one_percent_or_overlapping_median_ci_then_proof_size_then_label",
-        "demonstrable_speed_threshold_relative": 0.01,
+        "selection": "one_percent_prover_band_then_one_percent_or_overlapping_verifier_median_ci_then_proof_size_then_label",
+        "prover_selection_band_relative": PROVER_SELECTION_BAND_RELATIVE,
+        "verifier_selection_band_relative": VERIFIER_SELECTION_BAND_RELATIVE,
         "paired_confidence_interval_role": "diagnostic_only",
+        "prover_median_confidence_interval_role": "diagnostic_only",
+        "source_verifier_measurements": (
+            verifier_source.get("source_report") if verifier_source else None
+        ),
+        "verifier_rayon_threads": (
+            verifier_source.get("rayon_threads") if verifier_source else None
+        ),
         "tied_with_best_count": len(tied_details),
         "tied_with_best": tied_details,
+        "verifier_tied_count": len(verifier_tied_labels),
+        "verifier_tied": [
+            row for row in tied_details if row["label"] in verifier_tied_labels
+        ],
     }
 
 
@@ -1566,6 +1910,7 @@ def measured_candidate_summary(
     measurement: dict[str, Any],
     fastest: dict[str, Any],
     measured_rank: int,
+    verifier_measurement: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     fastest_seconds = float(fastest["measured_seconds"])
     measured_seconds = float(measurement["measured_seconds"])
@@ -1604,6 +1949,16 @@ def measured_candidate_summary(
         "heldout_proof_size_median_bytes": measurement.get(
             "heldout_proof_size_median_bytes"
         ),
+        "heldout_verify_seconds": (
+            verifier_measurement.get("heldout_verify_seconds")
+            if verifier_measurement is not None
+            else None
+        ),
+        "heldout_verify_median_ci_seconds": (
+            verifier_measurement.get("heldout_verify_median_ci_seconds")
+            if verifier_measurement is not None
+            else None
+        ),
         "selection_proof_size_bytes": measured_size(measurement),
         "configured_component_pow_bits": configured_pow_bits,
         "per_proof_component_pow_bits": per_proof_pow_bits,
@@ -1633,8 +1988,46 @@ def measurement_is_tied(row: dict[str, Any], fastest: dict[str, Any]) -> bool:
         if fastest_seconds > 0.0
         else float("inf")
     )
-    return relative <= 0.01 + 1e-12 or intervals_overlap(
-        median_interval(row), median_interval(fastest)
+    return relative <= PROVER_SELECTION_BAND_RELATIVE + 1e-12
+
+
+def verifier_seconds(
+    candidate: dict[str, Any], verifier_rows: dict[str, dict[str, Any]]
+) -> float:
+    measurement = verifier_rows.get(str(candidate["label"]))
+    if measurement is not None and measurement.get("heldout_verify_seconds") is not None:
+        return float(measurement["heldout_verify_seconds"])
+    projected = candidate.get("verifier_projected_seconds")
+    return float(projected) if projected is not None else float("inf")
+
+
+def verifier_measurement_is_tied(
+    candidate: dict[str, Any],
+    fastest: dict[str, Any],
+    verifier_rows: dict[str, dict[str, Any]],
+) -> bool:
+    candidate_seconds = verifier_seconds(candidate, verifier_rows)
+    fastest_seconds = verifier_seconds(fastest, verifier_rows)
+    if candidate_seconds == float("inf"):
+        return fastest_seconds == float("inf")
+    if candidate_seconds == fastest_seconds:
+        return True
+    relative = (
+        (candidate_seconds - fastest_seconds) / fastest_seconds
+        if fastest_seconds > 0.0
+        else float("inf")
+    )
+    if relative <= VERIFIER_SELECTION_BAND_RELATIVE + 1e-12:
+        return True
+    candidate_measurement = verifier_rows.get(str(candidate["label"]))
+    fastest_measurement = verifier_rows.get(str(fastest["label"]))
+    return (
+        candidate_measurement is not None
+        and fastest_measurement is not None
+        and intervals_overlap(
+            verifier_median_interval(candidate_measurement),
+            verifier_median_interval(fastest_measurement),
+        )
     )
 
 
@@ -1654,6 +2047,14 @@ def median_interval(row: dict[str, Any]) -> tuple[float, float]:
     return float(interval[0]), float(interval[1])
 
 
+def verifier_median_interval(row: dict[str, Any]) -> tuple[float, float]:
+    value = float(row["heldout_verify_seconds"])
+    interval = row.get("heldout_verify_median_ci_seconds")
+    if not isinstance(interval, list) or len(interval) != 2:
+        return value, value
+    return float(interval[0]), float(interval[1])
+
+
 def intervals_overlap(left: tuple[float, float], right: tuple[float, float]) -> bool:
     return max(left[0], right[0]) <= min(left[1], right[1]) + 1e-12
 
@@ -1666,8 +2067,13 @@ def proof_size(row: dict[str, Any]) -> int:
     return int(row.get("proof_size_bytes_estimate") or 0)
 
 
-def ranking_key(row: dict[str, Any]) -> tuple[float, int, str]:
-    return float(row["projected_seconds"]), proof_size(row), str(row["label"])
+def ranking_key(row: dict[str, Any]) -> tuple[float, float, int, str]:
+    return (
+        float(row["projected_seconds"]),
+        float(row.get("verifier_projected_seconds") or 0.0),
+        proof_size(row),
+        str(row["label"]),
+    )
 
 
 def relative_error(projected: float, measured: float) -> float:

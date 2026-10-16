@@ -127,10 +127,11 @@ pub fn sample_linear_statement() -> PcsStatement<DummyEngine> {
 
 pub fn sample_domain_separator() -> DomainSeparator {
     DomainSeparator::new(
-        &sample_shape(),
+        &koala_shape_single_constraint(1),
         &SecurityConfig::default(),
         &WhirParams::default(),
     )
+    .expect("sample relation has a domain separator")
 }
 
 pub fn koala_shape_single_constraint(num_cons: usize) -> R1csShape<F> {

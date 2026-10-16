@@ -2,12 +2,12 @@ error[E0308]: mismatched types
  --> tests/ui/proving_keys_are_not_interchangeable.rs:9:19
   |
 9 |     require_no_zk(key);
-  |     ------------- ^^^ expected `&ProvingKey<PoseidonEngine<...>, ...>`, found `&PoseidonZkProvingKey<...>`
+  |     ------------- ^^^ expected `&ProvingKey<PoseidonEngine<...>, ...>`, found `&PoseidonZkProvingKeyFor<...>`
   |     |
   |     arguments to this function are incorrect
   |
   = note: expected reference `&ProvingKey<PoseidonEngine<p3_field::extension::ExtField<p3_monty_31::monty_31::MontyField31<p3_koala_bear::koala_bear::KoalaBearParameters>, 4, p3_field::extension::Binomial<p3_monty_31::monty_31::MontyField31<p3_koala_bear::koala_bear::KoalaBearParameters>>>>, Plonky3WhirPcs>`
-             found reference `&PoseidonZkProvingKey<p3_field::extension::ExtField<p3_monty_31::monty_31::MontyField31<p3_koala_bear::koala_bear::KoalaBearParameters>, 4, p3_field::extension::Binomial<p3_monty_31::monty_31::MontyField31<p3_koala_bear::koala_bear::KoalaBearParameters>>>>`
+             found reference `&PoseidonZkProvingKeyFor<PoseidonEngine<p3_field::extension::ExtField<p3_monty_31::monty_31::MontyField31<p3_koala_bear::koala_bear::KoalaBearParameters>, 4, p3_field::extension::Binomial<p3_monty_31::monty_31::MontyField31<p3_koala_bear::koala_bear::KoalaBearParameters>>>>>`
 note: function defined here
  --> tests/ui/proving_keys_are_not_interchangeable.rs:5:4
   |
@@ -18,11 +18,11 @@ error[E0308]: mismatched types
   --> tests/ui/proving_keys_are_not_interchangeable.rs:13:21
    |
 13 |     require_full_zk(key);
-   |     --------------- ^^^ expected `&PoseidonZkProvingKey<...>`, found `&ProvingKey<PoseidonEngine<...>, ...>`
+   |     --------------- ^^^ expected `&PoseidonZkProvingKeyFor<...>`, found `&ProvingKey<PoseidonEngine<...>, ...>`
    |     |
    |     arguments to this function are incorrect
    |
-   = note: expected reference `&PoseidonZkProvingKey<p3_field::extension::ExtField<p3_monty_31::monty_31::MontyField31<p3_koala_bear::koala_bear::KoalaBearParameters>, 4, p3_field::extension::Binomial<p3_monty_31::monty_31::MontyField31<p3_koala_bear::koala_bear::KoalaBearParameters>>>>`
+   = note: expected reference `&PoseidonZkProvingKeyFor<PoseidonEngine<p3_field::extension::ExtField<p3_monty_31::monty_31::MontyField31<p3_koala_bear::koala_bear::KoalaBearParameters>, 4, p3_field::extension::Binomial<p3_monty_31::monty_31::MontyField31<p3_koala_bear::koala_bear::KoalaBearParameters>>>>>`
               found reference `&ProvingKey<PoseidonEngine<p3_field::extension::ExtField<p3_monty_31::monty_31::MontyField31<p3_koala_bear::koala_bear::KoalaBearParameters>, 4, p3_field::extension::Binomial<p3_monty_31::monty_31::MontyField31<p3_koala_bear::koala_bear::KoalaBearParameters>>>>, Plonky3WhirPcs>`
 note: function defined here
   --> tests/ui/proving_keys_are_not_interchangeable.rs:6:4

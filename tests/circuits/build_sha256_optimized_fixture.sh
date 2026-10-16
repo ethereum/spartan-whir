@@ -14,9 +14,16 @@ mkdir -p "$WORKDIR"
   --prime koalabear --r1cs --c --O2 -o "$WORKDIR"
 
 includes=(-I "$CPP_DIR")
+gmp_linker=(-lgmp)
 for dir in /opt/homebrew/include /usr/local/include; do
   if [ -f "$dir/gmp.h" ]; then
     includes+=(-I "$dir")
+  fi
+done
+for dir in /opt/homebrew/lib /usr/local/lib; do
+  if [ -f "$dir/libgmp.dylib" ] || [ -f "$dir/libgmp.so" ] || [ -f "$dir/libgmp.a" ]; then
+    gmp_linker=(-L "$dir" -lgmp)
+    break
   fi
 done
 
@@ -40,6 +47,7 @@ esac
   "$CPP_DIR/main.cpp" \
   "$CPP_DIR/sha256_2048b.cpp" \
   "${linker[@]}" \
+  "${gmp_linker[@]}" \
   -o "$library"
 
 printf 'wrote %s\n' "$library"

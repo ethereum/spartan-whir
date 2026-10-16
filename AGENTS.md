@@ -57,7 +57,7 @@ On-chain verification targets the final recursive root proof produced by a separ
 - Profile the 2048-byte full-ZK Spark path without rebuilding the circuit with:
   `SHA256_BENCH_WORKDIR=target/sha256-optimized-cache SHA256_BENCH_REUSE_ARTIFACTS=1 SHA256_BENCH_SIZES=2048 SHA256_BENCH_PROOF_MODES=full-zk SHA256_BENCH_MODES=spark SHA256_BENCH_SECURITY_BITS=116 SHA256_BENCH_PROFILE=1 SHA256_BENCH_PROFILE_DETAIL=1 RUSTFLAGS='-C target-cpu=native -C debuginfo=0' cargo run --release --features parallel --example sha256_bench`.
 - Benchmark/profiling output intended for direct human inspection should be stable and human-readable. Prefer labeled `key: value` fields and clear tree/group structure over raw debug dumps.
-- Record accepted benchmark comparisons under `benchmark-results/` with the workload, commit or working-tree description, machine, toolchain, flags, sample count, confidence intervals, proof sizes, and exact commands. Update the current result snapshot in `README.md` when it quotes an affected measurement. Keep the control measurements in the dated result so later work can recover the baseline numbers without rerunning that checkout.
+- Write benchmark output under `benchmark-results/` for local analysis. The directory is ignored and must not be committed. Document the latest relevant measurements directly in `README.md`, including the workload, commit or working-tree description, machine, toolchain, flags, sample count, confidence intervals, proof sizes, and exact commands needed to reproduce them. Generate raw samples, control results, logs, and analysis artifacts during development.
 - If a benchmark fixture is only shape-similar to a real circuit, document that approximation explicitly instead of describing it as the real circuit.
 - Keep `README.md` focused on the current codebase state rather than changelog-style history; describe the format and behavior that exist now.
 - Any protocol change that affects Spark fixed-table commitments must regenerate serialized `spark_fixed_commitments` and fixtures containing them.
@@ -70,6 +70,11 @@ time. Full-ZK Spark uses `poseidon_spark_schedule_scorer.py` to compose the
 witness, fixed-value, fixed-audit, and read reports. The scorers are
 not part of setup. Generate and measure schedules for the target circuit, then
 pass the selected setup configuration into setup.
+
+Add the `poseidon1` feature to every calibration, candidate, and heldout command
+when tuning the Poseidon1 profile. The report provenance must say
+`parallel,poseidon1`; a report that says only `parallel` does not identify the
+hash profile even if another field names it.
 
 For DirectSparse, optimize prover time while keeping memory feasible. Do not use
 proof size or recursive verifier cost to select a DirectSparse schedule. For
@@ -307,14 +312,17 @@ security checks remain present while its per-proof time and proof size are
 zero. The embedded audit schedule is pinned to its explicit reference, or to
 the component report's selected row when no reference is supplied.
 
-The composer retains the exact prover-time/proof-size Pareto set for each
-component and for the composition. `--top-per-component` limits only the
-component alternatives used to build the calibration shortlist. It does not
-truncate the retained component candidates. `--max-report-rows` must fit the
-composed Pareto rows, shortlist rows, and measured rows; composition fails
-instead of silently dropping any of them. The report records that no validated
-recursive-verifier metric is available. Proof size is not a substitute for
-recursive cycles or trace rows.
+When verifier coefficients are available, the component scorer preserves the
+complete prover-time, verifier-time, and proof-size Pareto set before applying
+`--max-report-rows`. It also preserves the selected row, measurement shortlist,
+and explicit references, and fails if the cap cannot hold that required set.
+The composer retains the three-axis Pareto set after bounding each component's
+excess prover projection by 1% of the best composed prover projection.
+`--top-per-component` limits only the alternatives used to build the
+calibration shortlist. `--max-report-rows` must fit the composed Pareto rows,
+shortlist rows, and measured rows; composition fails instead of silently
+dropping any of them. Proof size and one-thread native verifier time remain
+separate proxies; neither substitutes for LeanVM cycles or trace rows.
 
 Compose both 2048-byte privacy modes before heldout measurement:
 
@@ -377,8 +385,12 @@ end-to-end target and the same explicit 120-bit WHIR and 123-bit Merkle
 component targets. Its `setup_config` retains the 116-bit end-to-end target.
 
 Use the matching combined report for heldout measurement. After measurement,
-rerun the composer with `--measurements /tmp/spark-heldout.json`. Require
-`model.calibration.validation_within_ten_percent` before selecting a schedule.
+rerun the composer with `--measurements /tmp/spark-heldout.json` and a separate
+`RAYON_NUM_THREADS=1` heldout report through
+`--verifier-measurements /tmp/spark-heldout-verifier-1thread.json`. Require
+`model.calibration.validation_within_ten_percent` and
+`model.verifier_calibration.validation_within_twenty_percent` before selecting
+a schedule.
 To include a configured baseline when it is outside the model's top component
 rows, pass the witness, fixed-value, and fixed-audit reference labels once and
 pass `--reference-read-label` once per read report in the same order as the
@@ -446,16 +458,15 @@ from the full-ZK prover; never relabel a full-ZK report as no ZK. Pass
 ### Selection Rules
 
 - Treat the scorer as a pruning model, not a sub-percent ordering oracle.
-- Use untruncated component reports before pinning a schedule. The Spark
-  composer retains the time/proof-size frontier and fails when the report cap
-  cannot contain every frontier, shortlist, and measured row.
-- Interpret overlapping bootstrap median confidence intervals or a measured
-  slowdown of at most 1% as a time tie.
+- A bounded component report must retain its complete three-axis Pareto set,
+  shortlist, selected row, and explicit references. The scorer and Spark
+  composer fail when a report cap cannot contain their required rows.
+- For Spark, admit schedules whose measured client prover median is no more
+  than 1% above the fastest measured median. Prover confidence intervals are
+  diagnostic and do not expand this band.
 - For DirectSparse, prefer lower PoW and then stable label order among time-tied
   rows. Proof size is not a DirectSparse selection criterion.
-- For Spark, retain the Pareto set across measured prover time, proof size, and
-  recursive verifier work. Prefer lower PoW when the relevant tradeoffs are
-  tied because it has lower grind variance.
+- Within the Spark prover band, prefer one-thread native verifier time. Treat verifier medians within 1% or with overlapping bootstrap median intervals as tied, then prefer the smaller measured serialized proof and stable label order.
 - When recursive-verifier cycles or trace rows have not been measured, keep the
   native-time/proof-size finalists and state that the recursive choice remains
   unresolved. Do not treat proof size as recursive-verifier work.
@@ -469,7 +480,9 @@ from the full-ZK prover; never relabel a full-ZK report as no ZK. Pass
 `poseidon-schedule-heldout` runs repeats in shuffled round-robin passes. With
 `--randomize-linked-input-bits`, it varies SHA-style inputs per repeat to
 average deterministic PoW grind luck. Its output includes samples, the median,
-the mean, and a bootstrap median confidence interval.
+the mean, and a bootstrap median confidence interval for both proving and
+verification. The `parallel` verifier is partly multithreaded; use
+`RAYON_NUM_THREADS=1` for the sequential verifier proxy used by the scorer.
 The source report and every measured row carry one workload identity that binds
 the case label, R1CS SHA-256 digest, and constraint count. Heldout measurement
 checks it against `--r1cs`, `--case-label`, and the linked run name before setup
@@ -478,7 +491,9 @@ or timing.
 ### Artifacts and Model Limits
 
 - `poseidon-schedule-calibration` writes component coefficients and raw
-  microbenchmark measurements by extension.
+  microbenchmark measurements by extension. Its verifier coefficients cover
+  Merkle compression, leaf field elements, opened row field elements,
+  extension operations, and proof-of-work checks.
 - `poseidon-schedule-candidates` writes backend-derived schedules, component
   security targets, PoW, round data, work units, and `proof_mode`. End-to-end
   DirectSparse rows include a setup configuration. Explicit component-target
@@ -486,7 +501,8 @@ or timing.
   also contain `ell_zk`, `mask_log_inv_rate`, `zk_*` work, and proof-size
   estimates.
 - `poseidon_schedule_scorer.py` writes projected time, `cost_breakdown`,
-  validation status, `selected`, and `measurement_shortlist`. With measured
+  verifier projected time and breakdown, validation status, `selected`, and
+  `measurement_shortlist`. With measured
   input it also writes `selected_measured`, and `--out-config` writes that
   measured selection rather than the model-only selection. Pass `--workload-r1cs`,
   `--constraint-work`, and `--case-label` together for a report that will be
@@ -510,6 +526,18 @@ The linear model is:
 ```text
 projected_time = fixed_overhead + dft + merkle + merkle_path + row_opening + sumcheck + pow + spartan
 ```
+
+The verifier model is calibrated independently from proof size:
+
+```text
+projected_verifier_time = fixed_overhead + merkle_hashes + leaf_field_elements + row_field_elements + extension_operations + pow_checks
+```
+
+Do not multiply verifier time by proof bytes. That product is measured in
+byte-seconds and double-counts proof-shape effects already present in verifier
+time. For an explicit input-delivery model, use
+`verifier_time + proof_bytes / effective_input_bandwidth` and report the two
+terms separately.
 
 The SPARK composer adds the witness relation, post-setup fixed-table work, and
 every read group's commitment and opening. It excludes each fixed table's

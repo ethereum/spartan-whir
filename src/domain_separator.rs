@@ -2,10 +2,15 @@ use alloc::vec::Vec;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{R1csShape, SecurityConfig, SoundnessAssumption, SparkWhirParams, WhirParams};
+use crate::{
+    canonical_r1cs_relation_digest, engine::F, R1csShape, SecurityConfig, SoundnessAssumption,
+    SparkWhirParams, SpartanWhirError, WhirParams,
+};
 
-pub const NO_ZK_PROTOCOL_ID: &[u8] = b"spartan-whir-no-zk-v0";
-pub const FULL_ZK_PROTOCOL_ID: &[u8] = b"spartan-whir-full-zk-v0";
+pub const NO_ZK_PROTOCOL_ID: &[u8] = b"spartan-whir-no-zk-v1";
+pub const FULL_ZK_PROTOCOL_ID: &[u8] = b"spartan-whir-full-zk-v1";
+pub const POSEIDON1_NO_ZK_PROTOCOL_ID: &[u8] = b"spartan-whir-poseidon1-no-zk-v1";
+pub const POSEIDON1_FULL_ZK_PROTOCOL_ID: &[u8] = b"spartan-whir-poseidon1-full-zk-v1";
 /// Version of the verifier-visible SPARK matrix-closing transcript contract.
 /// Version 3 uses tagged transcript branches for the fixed-table and read-table
 /// openings.
@@ -24,6 +29,11 @@ pub struct DomainSeparator {
     pub num_cons: usize,
     pub num_vars: usize,
     pub num_io: usize,
+    /// Canonical digest of the complete padded A/B/C relation and its
+    /// original dimensions. It is included in the transcript domain separator
+    /// before the first Fiat-Shamir challenge, following the mitigation in
+    /// Fenzi, ePrint 2026/1838: <https://eprint.iacr.org/2026/1838>.
+    pub relation_digest: [u8; 32],
     pub security_level_bits: u32,
     pub merkle_security_bits: u32,
     pub soundness_assumption: SoundnessAssumption,
@@ -33,11 +43,11 @@ pub struct DomainSeparator {
 }
 
 impl DomainSeparator {
-    pub fn new<F>(
+    pub fn new(
         shape: &R1csShape<F>,
         security: &SecurityConfig,
         whir_params: &WhirParams,
-    ) -> Self {
+    ) -> Result<Self, SpartanWhirError> {
         Self::new_with_matrix_closing(
             shape,
             security,
@@ -46,12 +56,12 @@ impl DomainSeparator {
         )
     }
 
-    pub fn new_with_matrix_closing<F>(
+    pub fn new_with_matrix_closing(
         shape: &R1csShape<F>,
         security: &SecurityConfig,
         whir_params: &WhirParams,
         matrix_closing: MatrixClosingMode,
-    ) -> Self {
+    ) -> Result<Self, SpartanWhirError> {
         Self::new_with_matrix_closing_and_spark_whir_params(
             shape,
             security,
@@ -61,16 +71,19 @@ impl DomainSeparator {
         )
     }
 
-    pub fn new_with_matrix_closing_and_spark_whir_params<F>(
+    pub fn new_with_matrix_closing_and_spark_whir_params(
         shape: &R1csShape<F>,
         security: &SecurityConfig,
         whir_params: &WhirParams,
         matrix_closing: MatrixClosingMode,
         spark_whir_params: Option<SparkWhirParams>,
-    ) -> Self {
+    ) -> Result<Self, SpartanWhirError> {
         Self::new_with_protocol_id(
             NO_ZK_PROTOCOL_ID,
             shape,
+            shape.num_cons,
+            shape.num_vars,
+            shape.num_io,
             security,
             whir_params,
             matrix_closing,
@@ -78,16 +91,19 @@ impl DomainSeparator {
         )
     }
 
-    pub fn new_full_zk<F>(
+    pub fn new_full_zk(
         shape: &R1csShape<F>,
         security: &SecurityConfig,
         whir_params: &WhirParams,
         matrix_closing: MatrixClosingMode,
         spark_whir_params: Option<SparkWhirParams>,
-    ) -> Self {
+    ) -> Result<Self, SpartanWhirError> {
         Self::new_with_protocol_id(
             FULL_ZK_PROTOCOL_ID,
             shape,
+            shape.num_cons,
+            shape.num_vars,
+            shape.num_io,
             security,
             whir_params,
             matrix_closing,
@@ -95,9 +111,34 @@ impl DomainSeparator {
         )
     }
 
-    fn new_with_protocol_id<F>(
+    pub(crate) fn new_with_protocol_id(
         protocol_id: &[u8],
         shape: &R1csShape<F>,
+        num_cons_unpadded: usize,
+        num_vars_unpadded: usize,
+        num_io: usize,
+        security: &SecurityConfig,
+        whir_params: &WhirParams,
+        matrix_closing: MatrixClosingMode,
+        spark_whir_params: Option<SparkWhirParams>,
+    ) -> Result<Self, SpartanWhirError> {
+        let relation_digest =
+            canonical_r1cs_relation_digest(shape, num_cons_unpadded, num_vars_unpadded, num_io)?;
+        Ok(Self::new_with_protocol_id_and_relation_digest(
+            protocol_id,
+            shape,
+            relation_digest,
+            security,
+            whir_params,
+            matrix_closing,
+            spark_whir_params,
+        ))
+    }
+
+    pub(crate) fn new_with_protocol_id_and_relation_digest(
+        protocol_id: &[u8],
+        shape: &R1csShape<F>,
+        relation_digest: [u8; 32],
         security: &SecurityConfig,
         whir_params: &WhirParams,
         matrix_closing: MatrixClosingMode,
@@ -113,6 +154,7 @@ impl DomainSeparator {
             num_cons: shape.num_cons,
             num_vars: shape.num_vars,
             num_io: shape.num_io,
+            relation_digest,
             security_level_bits: security.security_level_bits,
             merkle_security_bits: security.merkle_security_bits,
             soundness_assumption: security.soundness_assumption,
@@ -121,8 +163,11 @@ impl DomainSeparator {
         }
     }
 
+    /// Encode the variable-length protocol identifier with its little-endian
+    /// u64 byte length before the fixed and separately framed configuration.
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut out = Vec::new();
+        out.extend_from_slice(&(self.protocol_id.len() as u64).to_le_bytes());
         out.extend_from_slice(&self.protocol_id);
         out.push(matrix_closing_to_byte(self.matrix_closing));
         if self.matrix_closing == MatrixClosingMode::Spark {
@@ -131,6 +176,7 @@ impl DomainSeparator {
         out.extend_from_slice(&(self.num_cons as u64).to_le_bytes());
         out.extend_from_slice(&(self.num_vars as u64).to_le_bytes());
         out.extend_from_slice(&(self.num_io as u64).to_le_bytes());
+        out.extend_from_slice(&self.relation_digest);
         out.extend_from_slice(&self.security_level_bits.to_le_bytes());
         out.extend_from_slice(&self.merkle_security_bits.to_le_bytes());
         out.push(soundness_to_byte(self.soundness_assumption));

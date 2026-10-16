@@ -5,7 +5,7 @@ error[E0277]: the trait bound `Plonky3HidingWhirPcs: MlePcs<PoseidonEngine<p3_fi
   |             ^^^^^^ unsatisfied trait bound
   |
   = help: the trait `MlePcs<PoseidonEngine<p3_field::extension::ExtField<p3_monty_31::monty_31::MontyField31<p3_koala_bear::koala_bear::KoalaBearParameters>, 4, p3_field::extension::Binomial<p3_monty_31::monty_31::MontyField31<p3_koala_bear::koala_bear::KoalaBearParameters>>>>>` is not implemented for `Plonky3HidingWhirPcs`
-help: the trait `MlePcs<PoseidonEngine<Ext>>` is implemented for `Plonky3WhirPcs`
+help: the following other types implement trait `MlePcs<E>`
  --> src/plonky3_whir_pcs.rs
   |
   | / impl<Ext> MlePcs<PoseidonEngine<Ext>> for Plonky3WhirPcs
@@ -15,7 +15,16 @@ help: the trait `MlePcs<PoseidonEngine<Ext>>` is implemented for `Plonky3WhirPcs
   | |         + CanSampleUniformBits<F>
   | |         + FieldChallenger<F>
   | |         + GrindingChallenger<Witness = F>,
-  | |__________________________________________^
+  | |__________________________________________^ `Plonky3WhirPcs` implements `MlePcs<PoseidonEngine<Ext>>`
+...
+  | / impl<Ext> MlePcs<Poseidon1Engine<Ext>> for Plonky3WhirPcs
+  | | where
+  | |     Ext: ExtField + TwoAdicField,
+  | |     Poseidon1Challenger: CanObserve<Poseidon1Commitment>
+  | |         + CanSampleUniformBits<F>
+  | |         + FieldChallenger<F>
+  | |         + GrindingChallenger<Witness = F>,
+  | |__________________________________________^ `Plonky3WhirPcs` implements `MlePcs<Poseidon1Engine<Ext>>`
 note: required by a bound in `SpartanProtocol`
  --> src/protocol.rs
   |

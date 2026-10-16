@@ -47,17 +47,20 @@ use rand::{
     distr::{Distribution, StandardUniform},
     rngs::StdRng,
 };
-use serde::{Deserialize, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 use crate::profiling::profile_scope;
 use crate::{
     engine::{
-        poseidon_merkle_compress, poseidon_merkle_hash, ExtField, PoseidonChallenger,
-        PoseidonEngine, PoseidonFieldHash, PoseidonNodeCompress, F,
+        poseidon1_challenger, poseidon1_merkle_compress, poseidon1_merkle_hash,
+        poseidon_merkle_compress, poseidon_merkle_hash, ExtField, Plonky3PoseidonEngine,
+        Poseidon1Challenger, Poseidon1Engine, Poseidon1FieldHash, Poseidon1NodeCompress,
+        PoseidonChallenger, PoseidonEngine, PoseidonFieldHash, PoseidonNodeCompress,
+        QuinticExtension, F,
     },
     CommittedPolynomialView, Evaluations, InvalidConfigReason, MatrixClosingMode, MlePcs, NoZkPcs,
     PcsStatement, ProtocolPcs, SealedNoZkPcs, SoundnessAssumption, SparkReadPcs, SpartanProtocol,
-    SpartanWhirError, WhirPcsConfig, ZkWhirPcsConfig,
+    SpartanWhirEngine, SpartanWhirError, WhirPcsConfig, ZkWhirPcsConfig,
 };
 
 const FULL_ZK_SECURITY_SLACK_BITS: u32 = 2;
@@ -96,6 +99,13 @@ pub type PoseidonSparkSpartanProof<Ext> =
     crate::SparkSpartanProof<PoseidonEngine<Ext>, Plonky3WhirPcs>;
 pub type PoseidonSpartanSnarkConfig = crate::SpartanSnarkConfig;
 
+pub type Poseidon1SpartanProtocol<Ext> = SpartanProtocol<Poseidon1Engine<Ext>, Plonky3WhirPcs>;
+pub type Poseidon1ProvingKey<Ext> = crate::ProvingKey<Poseidon1Engine<Ext>, Plonky3WhirPcs>;
+pub type Poseidon1VerifyingKey<Ext> = crate::VerifyingKey<Poseidon1Engine<Ext>, Plonky3WhirPcs>;
+pub type Poseidon1SpartanProof<Ext> = crate::SpartanProof<Poseidon1Engine<Ext>, Plonky3WhirPcs>;
+pub type Poseidon1SparkSpartanProof<Ext> =
+    crate::SparkSpartanProof<Poseidon1Engine<Ext>, Plonky3WhirPcs>;
+
 pub type InnerPoseidonMmcs = MerkleTreeMmcs<
     <F as Field>::Packing,
     <F as Field>::Packing,
@@ -109,10 +119,8 @@ pub type PoseidonCommitment = <PoseidonMmcs as Mmcs<F>>::Commitment;
 pub type PoseidonRelationProof<Ext> = ZkWhirRelationProof<F, Ext, PoseidonMmcs>;
 type PoseidonPlainMerkleTree = <PoseidonMmcs as Mmcs<F>>::ProverData<DenseMatrix<F>>;
 type PoseidonPlainWhirProof<Ext> = WhirProof<F, Ext, PoseidonMmcs>;
-type PoseidonMultiProof = <PoseidonMmcs as Mmcs<F>>::MultiProof;
+pub type PoseidonMultiProof = <PoseidonMmcs as Mmcs<F>>::MultiProof;
 type PoseidonPlainWhirConfig<Ext> = Plonky3PlainWhirConfig<Ext, F, PoseidonChallenger>;
-pub(crate) type PoseidonHidingPcs<Ext> =
-    HidingWhirPcs<Ext, F, Radix2DFTSmallBatch<F>, PoseidonMmcs, PoseidonChallenger, StdRng>;
 type PoseidonPlainPcs<Ext> = WhirProver<
     Ext,
     F,
@@ -130,6 +138,294 @@ type PoseidonSparkReadPcs<Ext> = WhirProver<
     PrefixProver<F, Ext>,
 >;
 type PoseidonSparkReadProverData<Ext> = WhirProverData<F, Ext, PoseidonMmcs, PrefixProver<F, Ext>>;
+
+pub type InnerPoseidon1Mmcs = MerkleTreeMmcs<
+    <F as Field>::Packing,
+    <F as Field>::Packing,
+    Poseidon1FieldHash,
+    Poseidon1NodeCompress,
+    2,
+    8,
+>;
+pub type Poseidon1Mmcs = RcMmcs<InnerPoseidon1Mmcs>;
+pub type Poseidon1Commitment = <Poseidon1Mmcs as Mmcs<F>>::Commitment;
+pub type Poseidon1RelationProof<Ext> = ZkWhirRelationProof<F, Ext, Poseidon1Mmcs>;
+type Poseidon1PlainMerkleTree = <Poseidon1Mmcs as Mmcs<F>>::ProverData<DenseMatrix<F>>;
+type Poseidon1PlainWhirProof<Ext> = WhirProof<F, Ext, Poseidon1Mmcs>;
+pub(crate) type Poseidon1PlainWhirConfig<Ext> = Plonky3PlainWhirConfig<Ext, F, Poseidon1Challenger>;
+type Poseidon1PlainPcs<Ext> = WhirProver<
+    Ext,
+    F,
+    Radix2DFTSmallBatch<F>,
+    Poseidon1Mmcs,
+    Poseidon1Challenger,
+    SpartanEqLayout<Ext>,
+>;
+type Poseidon1SparkReadPcs<Ext> = WhirProver<
+    Ext,
+    F,
+    Radix2DFTSmallBatch<F>,
+    Poseidon1Mmcs,
+    Poseidon1Challenger,
+    PrefixProver<F, Ext>,
+>;
+type Poseidon1SparkReadProverData<Ext> =
+    WhirProverData<F, Ext, Poseidon1Mmcs, PrefixProver<F, Ext>>;
+
+pub trait FullZkPoseidonEngine:
+    Plonky3PoseidonEngine + crate::protocol::SpartanContextEngine + Send + Sync + Sized
+where
+    Self::EF: ExtField,
+    Self::Challenger: FieldChallenger<F> + GrindingChallenger<Witness = F>,
+{
+    type Commitment: Clone + PartialEq + Eq + Send + Sync + Serialize + DeserializeOwned;
+    type PlainProverData: Clone
+        + Send
+        + Sync
+        + Serialize
+        + DeserializeOwned
+        + CommittedPolynomialView<Self::EF>;
+    type PlainProof: Clone + Send + Sync + Serialize + DeserializeOwned;
+    type ZkMmcs: Mmcs<F, Commitment = Self::Commitment, MultiProof = PoseidonMultiProof>
+        + Clone
+        + Send
+        + Sync;
+
+    const FULL_ZK_PROTOCOL_ID: &'static [u8];
+    const HASH_PROFILE_TAG: u32;
+    const FULL_ZK_STATEMENT_DIGEST_ID: &'static str;
+
+    fn full_zk_mmcs() -> Self::ZkMmcs;
+
+    fn plain_whir_guest_config_parts(
+        config: &WhirPcsConfig,
+    ) -> Result<
+        (
+            Plonky3PlainWhirConfig<Self::EF, F, Self::Challenger>,
+            Vec<u32>,
+        ),
+        SpartanWhirError,
+    >;
+
+    /// Clone transcript state for proof reconstruction without recording replay.
+    fn challenger_for_replay(challenger: &Self::Challenger) -> Self::Challenger;
+
+    fn validate_commitment(commitment: &Self::Commitment) -> Result<(), SpartanWhirError>;
+
+    fn validate_plain_proof_shape(
+        config: &WhirPcsConfig,
+        proof: &Self::PlainProof,
+    ) -> Result<(), SpartanWhirError>;
+
+    fn validate_compressed_plain_proof_shape(
+        config: &WhirPcsConfig,
+        proof: &Self::PlainProof,
+        final_rows: bool,
+    ) -> Result<(), SpartanWhirError>;
+
+    /// Validate an explicit native transport omission of the initial fixed oracle.
+    fn validate_cached_plain_proof_shape(
+        config: &WhirPcsConfig,
+        proof: &Self::PlainProof,
+        final_rows: bool,
+    ) -> Result<(), SpartanWhirError>;
+}
+
+/// Plain WHIR operations required by the full-ZK Spartan protocol for either
+/// supported Poseidon transcript.
+pub trait FullZkPoseidonPcs<E>:
+    SparkReadPcs<E, ReadProverData: Send, ParsedReadCommitment: Send>
+    + ProtocolPcs<E, ParsedCommitment: Send>
+    + MlePcs<
+        E,
+        Config = WhirPcsConfig,
+        Commitment = E::Commitment,
+        ProverData = E::PlainProverData,
+        Proof = E::PlainProof,
+    >
+where
+    E: FullZkPoseidonEngine,
+    E::EF: ExtField,
+    E::Challenger: FieldChallenger<F> + GrindingChallenger<Witness = F>,
+{
+}
+
+impl<E> FullZkPoseidonPcs<E> for Plonky3WhirPcs
+where
+    E: FullZkPoseidonEngine,
+    E::EF: ExtField,
+    E::Challenger: FieldChallenger<F> + GrindingChallenger<Witness = F>,
+    Plonky3WhirPcs: SparkReadPcs<E, ReadProverData: Send, ParsedReadCommitment: Send>
+        + ProtocolPcs<E, ParsedCommitment: Send>
+        + MlePcs<
+            E,
+            Config = WhirPcsConfig,
+            Commitment = E::Commitment,
+            ProverData = E::PlainProverData,
+            Proof = E::PlainProof,
+        >,
+{
+}
+
+pub type PoseidonZkMmcsFor<E> = <E as FullZkPoseidonEngine>::ZkMmcs;
+pub type PoseidonZkCommitmentFor<E> = <E as FullZkPoseidonEngine>::Commitment;
+pub type PoseidonZkRelationProofFor<E> =
+    ZkWhirRelationProof<F, <E as SpartanWhirEngine>::EF, PoseidonZkMmcsFor<E>>;
+pub(crate) type PoseidonZkHidingPcsFor<E> = HidingWhirPcs<
+    <E as SpartanWhirEngine>::EF,
+    F,
+    Radix2DFTSmallBatch<F>,
+    PoseidonZkMmcsFor<E>,
+    <E as SpartanWhirEngine>::Challenger,
+    StdRng,
+>;
+
+pub type PoseidonZkMmcs = PoseidonZkMmcsFor<PoseidonEngine<QuinticExtension>>;
+pub type PoseidonZkCommitment = PoseidonZkCommitmentFor<PoseidonEngine<QuinticExtension>>;
+pub type PoseidonZkRelationProof<Ext> = PoseidonZkRelationProofFor<PoseidonEngine<Ext>>;
+pub type Poseidon1ZkMmcs = PoseidonZkMmcsFor<Poseidon1Engine<QuinticExtension>>;
+pub type Poseidon1ZkCommitment = PoseidonZkCommitmentFor<Poseidon1Engine<QuinticExtension>>;
+pub type Poseidon1ZkRelationProof<Ext> = PoseidonZkRelationProofFor<Poseidon1Engine<Ext>>;
+
+impl<Ext: ExtField> FullZkPoseidonEngine for PoseidonEngine<Ext>
+where
+    Plonky3WhirPcs: MlePcs<Self, Config = WhirPcsConfig, Proof = PoseidonPlainWhirProof<Ext>>,
+{
+    type Commitment = PoseidonCommitment;
+    type PlainProverData = Plonky3WhirProverData<Ext>;
+    type PlainProof = PoseidonPlainWhirProof<Ext>;
+    type ZkMmcs = PoseidonMmcs;
+
+    const FULL_ZK_PROTOCOL_ID: &'static [u8] = crate::FULL_ZK_PROTOCOL_ID;
+    const HASH_PROFILE_TAG: u32 = 1;
+    const FULL_ZK_STATEMENT_DIGEST_ID: &'static str =
+        "poseidon2-width-16-length-prefixed-statement-v1";
+
+    fn plain_whir_guest_config_parts(
+        config: &WhirPcsConfig,
+    ) -> Result<
+        (
+            Plonky3PlainWhirConfig<Self::EF, F, Self::Challenger>,
+            Vec<u32>,
+        ),
+        SpartanWhirError,
+    > {
+        poseidon_plain_whir_guest_config_parts(config)
+    }
+
+    fn challenger_for_replay(challenger: &Self::Challenger) -> Self::Challenger {
+        challenger.clone().without_trace()
+    }
+
+    fn full_zk_mmcs() -> Self::ZkMmcs {
+        RcMmcs(InnerPoseidonMmcs::new(
+            poseidon_merkle_hash(),
+            poseidon_merkle_compress(),
+            0,
+        ))
+    }
+
+    fn validate_commitment(commitment: &Self::Commitment) -> Result<(), SpartanWhirError> {
+        validate_poseidon_commitment(commitment)
+    }
+
+    fn validate_plain_proof_shape(
+        config: &WhirPcsConfig,
+        proof: &Self::PlainProof,
+    ) -> Result<(), SpartanWhirError> {
+        validate_poseidon_plain_proof_shape_from_config(config, proof)
+    }
+
+    fn validate_compressed_plain_proof_shape(
+        config: &WhirPcsConfig,
+        proof: &Self::PlainProof,
+        final_rows: bool,
+    ) -> Result<(), SpartanWhirError> {
+        config.validate()?;
+        let pcs = build_poseidon_plain_pcs::<Ext>(config)?;
+        validate_poseidon_plain_proof_shape_compressed(&pcs.config, proof, final_rows, false)
+    }
+
+    fn validate_cached_plain_proof_shape(
+        config: &WhirPcsConfig,
+        proof: &Self::PlainProof,
+        final_rows: bool,
+    ) -> Result<(), SpartanWhirError> {
+        config.validate()?;
+        let pcs = build_poseidon_plain_pcs::<Ext>(config)?;
+        validate_poseidon_plain_proof_shape_compressed(&pcs.config, proof, final_rows, true)
+    }
+}
+
+impl<Ext: ExtField> FullZkPoseidonEngine for Poseidon1Engine<Ext>
+where
+    Plonky3WhirPcs: MlePcs<Self, Config = WhirPcsConfig, Proof = Poseidon1PlainWhirProof<Ext>>,
+{
+    type Commitment = Poseidon1Commitment;
+    type PlainProverData = Poseidon1WhirProverData<Ext>;
+    type PlainProof = Poseidon1PlainWhirProof<Ext>;
+    type ZkMmcs = Poseidon1Mmcs;
+
+    const FULL_ZK_PROTOCOL_ID: &'static [u8] = crate::POSEIDON1_FULL_ZK_PROTOCOL_ID;
+    const HASH_PROFILE_TAG: u32 = 2;
+    const FULL_ZK_STATEMENT_DIGEST_ID: &'static str =
+        "poseidon1-width-16-length-prefixed-statement-v1";
+
+    fn plain_whir_guest_config_parts(
+        config: &WhirPcsConfig,
+    ) -> Result<
+        (
+            Plonky3PlainWhirConfig<Self::EF, F, Self::Challenger>,
+            Vec<u32>,
+        ),
+        SpartanWhirError,
+    > {
+        poseidon1_plain_whir_guest_config_parts(config)
+    }
+
+    fn challenger_for_replay(challenger: &Self::Challenger) -> Self::Challenger {
+        challenger.clone().without_trace()
+    }
+
+    fn full_zk_mmcs() -> Self::ZkMmcs {
+        RcMmcs(InnerPoseidon1Mmcs::new(
+            poseidon1_merkle_hash(),
+            poseidon1_merkle_compress(),
+            0,
+        ))
+    }
+
+    fn validate_commitment(commitment: &Self::Commitment) -> Result<(), SpartanWhirError> {
+        validate_poseidon_commitment(commitment)
+    }
+
+    fn validate_plain_proof_shape(
+        config: &WhirPcsConfig,
+        proof: &Self::PlainProof,
+    ) -> Result<(), SpartanWhirError> {
+        validate_poseidon1_plain_proof_shape_from_config(config, proof)
+    }
+
+    fn validate_compressed_plain_proof_shape(
+        config: &WhirPcsConfig,
+        proof: &Self::PlainProof,
+        final_rows: bool,
+    ) -> Result<(), SpartanWhirError> {
+        config.validate()?;
+        let pcs = build_poseidon1_plain_pcs::<Ext>(config)?;
+        validate_poseidon1_plain_proof_shape_compressed(&pcs.config, proof, final_rows, false)
+    }
+
+    fn validate_cached_plain_proof_shape(
+        config: &WhirPcsConfig,
+        proof: &Self::PlainProof,
+        final_rows: bool,
+    ) -> Result<(), SpartanWhirError> {
+        config.validate()?;
+        let pcs = build_poseidon1_plain_pcs::<Ext>(config)?;
+        validate_poseidon1_plain_proof_shape_compressed(&pcs.config, proof, final_rows, true)
+    }
+}
 
 use plain_whir_layout::SpartanEqLayout;
 
@@ -153,10 +449,15 @@ pub(crate) fn validate_poseidon_plain_proof_commitments<Ext: ExtField>(
     Ok(())
 }
 
-pub(crate) fn validate_poseidon_relation_proof_shape<Ext: ExtField>(
-    config: &ZkWhirConfig<Ext, F, PoseidonChallenger>,
-    proof: &PoseidonRelationProof<Ext>,
-) -> Result<(), SpartanWhirError> {
+pub(crate) fn validate_poseidon_relation_proof_shape<E>(
+    config: &ZkWhirConfig<E::EF, F, E::Challenger>,
+    proof: &PoseidonZkRelationProofFor<E>,
+) -> Result<(), SpartanWhirError>
+where
+    E: FullZkPoseidonEngine,
+    E::EF: ExtField,
+    E::Challenger: FieldChallenger<F> + GrindingChallenger<Witness = F>,
+{
     let expected_rounds = config.n_rounds();
     let expected_sumchecks = expected_rounds
         .checked_add(1)
@@ -168,12 +469,15 @@ pub(crate) fn validate_poseidon_relation_proof_shape<Ext: ExtField>(
     if proof.rounds.len() != expected_rounds
         || proof.sumchecks.len() != expected_sumchecks
         || proof.sumcheck_mask_commitments.len() != expected_sumchecks
-        || proof.base_case.fresh_mask_commitments.len() != expected_mask_groups
+        || proof.base_case.carried_mask_openings.len() != expected_mask_groups
+        || proof.base_case.fresh_mask_commitments.len() != proof.base_case.fresh_mask_openings.len()
+        || proof.base_case.fresh_mask_commitments.len() > expected_mask_groups
+        || proof.base_case.fresh_mask_commitments.is_empty()
     {
         return Err(SpartanWhirError::InvalidProofShape);
     }
     for commitment in &proof.sumcheck_mask_commitments {
-        validate_poseidon_commitment(commitment)?;
+        E::validate_commitment(commitment)?;
     }
     for (round_index, (round, params)) in proof
         .rounds
@@ -181,8 +485,8 @@ pub(crate) fn validate_poseidon_relation_proof_shape<Ext: ExtField>(
         .zip(&config.round_parameters)
         .enumerate()
     {
-        validate_poseidon_commitment(&round.commitment)?;
-        validate_poseidon_commitment(&round.mask_commitment)?;
+        E::validate_commitment(&round.commitment)?;
+        E::validate_commitment(&round.mask_commitment)?;
         if round.ood_answers.len() != params.ood_samples {
             return Err(SpartanWhirError::InvalidProofShape);
         }
@@ -202,9 +506,9 @@ pub(crate) fn validate_poseidon_relation_proof_shape<Ext: ExtField>(
             leaf_count,
         )?;
     }
-    validate_poseidon_commitment(&proof.base_case.fresh_main_commitment)?;
+    E::validate_commitment(&proof.base_case.fresh_main_commitment)?;
     for commitment in &proof.base_case.fresh_mask_commitments {
-        validate_poseidon_commitment(commitment)?;
+        E::validate_commitment(commitment)?;
     }
     let final_config = config.final_round_config();
     let final_width = 1usize
@@ -274,9 +578,48 @@ fn validate_query_opening_shape<Ext>(
     }
 }
 
+fn validate_cached_query_opening_shape<Ext>(
+    openings: &QueryOpenings<F, Ext, PoseidonMultiProof>,
+    cached_initial: bool,
+    expected_base: bool,
+    expected_rows: usize,
+    expected_width: usize,
+    leaf_count: usize,
+) -> Result<(), SpartanWhirError> {
+    if cached_initial {
+        match openings {
+            QueryOpenings::Base(opening)
+                if expected_base
+                    && opening.rows.is_empty()
+                    && opening.proof.sibling_hashes.is_empty() =>
+            {
+                Ok(())
+            }
+            _ => Err(SpartanWhirError::InvalidProofShape),
+        }
+    } else {
+        validate_query_opening_shape(
+            openings,
+            expected_base,
+            expected_rows,
+            expected_width,
+            leaf_count,
+        )
+    }
+}
+
 pub(crate) fn validate_poseidon_plain_proof_shape<Ext: ExtField>(
     config: &PoseidonPlainWhirConfig<Ext>,
     proof: &PoseidonPlainWhirProof<Ext>,
+) -> Result<(), SpartanWhirError> {
+    validate_poseidon_plain_proof_shape_compressed(config, proof, false, false)
+}
+
+fn validate_poseidon_plain_proof_shape_compressed<Ext: ExtField>(
+    config: &PoseidonPlainWhirConfig<Ext>,
+    proof: &PoseidonPlainWhirProof<Ext>,
+    final_rows: bool,
+    cached_initial: bool,
 ) -> Result<(), SpartanWhirError> {
     if proof.initial_ood_answers.len() != config.commitment_ood_samples
         || proof.rounds.len() != config.n_rounds()
@@ -315,8 +658,9 @@ pub(crate) fn validate_poseidon_plain_proof_shape<Ext: ExtField>(
             .domain_size
             .checked_shr(params.folding_factor as u32)
             .ok_or(SpartanWhirError::InvalidProofShape)?;
-        validate_query_opening_shape(
+        validate_cached_query_opening_shape(
             &round.openings,
+            cached_initial && round_index == 0,
             round_index == 0,
             params.num_queries.min(leaf_count),
             width,
@@ -342,11 +686,12 @@ pub(crate) fn validate_poseidon_plain_proof_shape<Ext: ExtField>(
         .domain_size
         .checked_shr(final_config.folding_factor as u32)
         .ok_or(SpartanWhirError::InvalidProofShape)?;
-    validate_query_opening_shape(
+    validate_cached_query_opening_shape(
         &proof.final_openings,
+        cached_initial && config.n_rounds() == 0,
         config.n_rounds() == 0,
         final_config.num_queries.min(final_leaf_count),
-        final_width,
+        final_width - usize::from(final_rows && config.n_rounds() != 0),
         final_leaf_count,
     )?;
     match (config.final_sumcheck_rounds, &proof.final_sumcheck) {
@@ -365,6 +710,121 @@ pub(crate) fn validate_poseidon_plain_proof_shape_from_config<Ext: ExtField>(
     config.validate()?;
     let pcs = build_poseidon_plain_pcs::<Ext>(config)?;
     validate_poseidon_plain_proof_shape(&pcs.config, proof)
+}
+
+pub(crate) fn validate_poseidon1_plain_proof_shape_from_config<Ext: ExtField>(
+    config: &WhirPcsConfig,
+    proof: &Poseidon1PlainWhirProof<Ext>,
+) -> Result<(), SpartanWhirError> {
+    config.validate()?;
+    let pcs = build_poseidon1_plain_pcs::<Ext>(config)?;
+    validate_poseidon1_plain_proof_shape(&pcs.config, proof)
+}
+
+pub(crate) fn validate_poseidon1_plain_proof_commitments<Ext: ExtField>(
+    proof: &Poseidon1PlainWhirProof<Ext>,
+) -> Result<(), SpartanWhirError> {
+    for round in &proof.rounds {
+        if let Some(commitment) = &round.commitment {
+            validate_poseidon_commitment(commitment)?;
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_poseidon1_plain_proof_shape<Ext: ExtField>(
+    config: &Poseidon1PlainWhirConfig<Ext>,
+    proof: &Poseidon1PlainWhirProof<Ext>,
+) -> Result<(), SpartanWhirError> {
+    validate_poseidon1_plain_proof_shape_compressed(config, proof, false, false)
+}
+
+fn validate_poseidon1_plain_proof_shape_compressed<Ext: ExtField>(
+    config: &Poseidon1PlainWhirConfig<Ext>,
+    proof: &Poseidon1PlainWhirProof<Ext>,
+    final_rows: bool,
+    cached_initial: bool,
+) -> Result<(), SpartanWhirError> {
+    if proof.initial_ood_answers.len() != config.commitment_ood_samples
+        || proof.rounds.len() != config.n_rounds()
+    {
+        return Err(SpartanWhirError::InvalidProofShape);
+    }
+    validate_plain_sumcheck_shape(
+        &proof.initial_sumcheck,
+        config.round_folding_factor(0),
+        config.starting_folding_pow_bits,
+    )?;
+
+    for (round_index, (round, params)) in proof
+        .rounds
+        .iter()
+        .zip(&config.round_parameters)
+        .enumerate()
+    {
+        let commitment = round
+            .commitment
+            .as_ref()
+            .ok_or(SpartanWhirError::InvalidProofShape)?;
+        validate_poseidon_commitment(commitment)?;
+        if round.ood_answers.len() != params.ood_samples {
+            return Err(SpartanWhirError::InvalidProofShape);
+        }
+        validate_plain_sumcheck_shape(
+            &round.sumcheck,
+            config.round_folding_factor(round_index + 1),
+            params.folding_pow_bits,
+        )?;
+        let width = 1usize
+            .checked_shl(params.folding_factor as u32)
+            .ok_or(SpartanWhirError::InvalidProofShape)?;
+        let leaf_count = params
+            .domain_size
+            .checked_shr(params.folding_factor as u32)
+            .ok_or(SpartanWhirError::InvalidProofShape)?;
+        validate_cached_query_opening_shape(
+            &round.openings,
+            cached_initial && round_index == 0,
+            round_index == 0,
+            params.num_queries.min(leaf_count),
+            width,
+            leaf_count,
+        )?;
+    }
+
+    let final_config = config.final_round_config();
+    let expected_final_poly_len = 1usize
+        .checked_shl(final_config.num_variables as u32)
+        .ok_or(SpartanWhirError::InvalidProofShape)?;
+    if proof
+        .final_poly
+        .as_ref()
+        .is_none_or(|poly| poly.as_slice().len() != expected_final_poly_len)
+    {
+        return Err(SpartanWhirError::InvalidProofShape);
+    }
+    let final_width = 1usize
+        .checked_shl(final_config.folding_factor as u32)
+        .ok_or(SpartanWhirError::InvalidProofShape)?;
+    let final_leaf_count = final_config
+        .domain_size
+        .checked_shr(final_config.folding_factor as u32)
+        .ok_or(SpartanWhirError::InvalidProofShape)?;
+    validate_cached_query_opening_shape(
+        &proof.final_openings,
+        cached_initial && config.n_rounds() == 0,
+        config.n_rounds() == 0,
+        final_config.num_queries.min(final_leaf_count),
+        final_width - usize::from(final_rows && config.n_rounds() != 0),
+        final_leaf_count,
+    )?;
+    match (config.final_sumcheck_rounds, &proof.final_sumcheck) {
+        (0, None) => Ok(()),
+        (rounds, Some(data)) if rounds > 0 => {
+            validate_plain_sumcheck_shape(data, rounds, config.final_folding_pow_bits)
+        }
+        _ => Err(SpartanWhirError::InvalidProofShape),
+    }
 }
 
 #[derive(Clone)]
@@ -450,6 +910,16 @@ pub struct Plonky3WhirProverData<Ext> {
     num_variables: usize,
 }
 
+impl<Ext> crate::fixed_oracle_cache::FixedOracleProverData<PoseidonMmcs>
+    for Plonky3WhirProverData<Ext>
+{
+    fn into_initial_tree(
+        self,
+    ) -> Result<<PoseidonMmcs as Mmcs<F>>::ProverData<DenseMatrix<F>>, SpartanWhirError> {
+        self.merkle_tree.ok_or(SpartanWhirError::InvalidProofShape)
+    }
+}
+
 impl<Ext: ExtField> Clone for Plonky3WhirProverData<Ext> {
     fn clone(&self) -> Self {
         Self {
@@ -464,6 +934,50 @@ impl<Ext: ExtField> Clone for Plonky3WhirProverData<Ext> {
 }
 
 impl<Ext: ExtField> CommittedPolynomialView<Ext> for Plonky3WhirProverData<Ext> {
+    fn num_variables(&self) -> usize {
+        self.num_variables
+    }
+
+    fn polynomial(&self) -> &[F] {
+        &self.polynomial
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(bound(serialize = "Ext: Serialize", deserialize = "Ext: Deserialize<'de>"))]
+pub struct Poseidon1WhirProverData<Ext> {
+    commitment: Poseidon1Commitment,
+    merkle_tree: Option<Poseidon1PlainMerkleTree>,
+    initial_ood_answers: Vec<Ext>,
+    polynomial: Vec<F>,
+    ood_pairs: Vec<(Vec<Ext>, Ext)>,
+    num_variables: usize,
+}
+
+impl<Ext> crate::fixed_oracle_cache::FixedOracleProverData<Poseidon1Mmcs>
+    for Poseidon1WhirProverData<Ext>
+{
+    fn into_initial_tree(
+        self,
+    ) -> Result<<Poseidon1Mmcs as Mmcs<F>>::ProverData<DenseMatrix<F>>, SpartanWhirError> {
+        self.merkle_tree.ok_or(SpartanWhirError::InvalidProofShape)
+    }
+}
+
+impl<Ext: ExtField> Clone for Poseidon1WhirProverData<Ext> {
+    fn clone(&self) -> Self {
+        Self {
+            commitment: self.commitment.clone(),
+            merkle_tree: self.merkle_tree.clone(),
+            initial_ood_answers: self.initial_ood_answers.clone(),
+            polynomial: self.polynomial.clone(),
+            ood_pairs: self.ood_pairs.clone(),
+            num_variables: self.num_variables,
+        }
+    }
+}
+
+impl<Ext: ExtField> CommittedPolynomialView<Ext> for Poseidon1WhirProverData<Ext> {
     fn num_variables(&self) -> usize {
         self.num_variables
     }
@@ -550,7 +1064,7 @@ where
         statement: &PcsStatement<PoseidonEngine<Ext>>,
         challenger: &mut PoseidonChallenger,
     ) -> Result<Self::Proof, SpartanWhirError> {
-        open_plain_without_commit_observation(config, prover_data, statement, challenger)
+        open_plain_without_commit_observation(config, prover_data, statement, false, challenger)
     }
 
     fn verify(
@@ -656,6 +1170,35 @@ where
         proof: &Self::Proof,
         challenger: &mut PoseidonChallenger,
     ) -> Result<(), SpartanWhirError> {
+        <Self as ProtocolPcs<PoseidonEngine<Ext>>>::verify_finalize_compressed(
+            config, parsed, statement, proof, false, challenger,
+        )
+    }
+
+    fn open_compressed(
+        config: &Self::Config,
+        prover_data: Self::ProverData,
+        statement: &PcsStatement<PoseidonEngine<Ext>>,
+        final_rows: bool,
+        challenger: &mut PoseidonChallenger,
+    ) -> Result<Self::Proof, SpartanWhirError> {
+        open_plain_without_commit_observation(
+            config,
+            prover_data,
+            statement,
+            final_rows,
+            challenger,
+        )
+    }
+
+    fn verify_finalize_compressed(
+        config: &Self::Config,
+        parsed: &Self::ParsedCommitment,
+        statement: &PcsStatement<PoseidonEngine<Ext>>,
+        proof: &Self::Proof,
+        final_rows: bool,
+        challenger: &mut PoseidonChallenger,
+    ) -> Result<(), SpartanWhirError> {
         let _profile = profile_scope("verify_finalize_plain");
         config.validate()?;
         let pcs = build_poseidon_plain_pcs::<Ext>(config)?;
@@ -678,6 +1221,279 @@ where
         let mut claimed_eval = Ext::ZERO;
         initial_constraint.combine_evals(&mut claimed_eval);
 
+        let mut reconstructed;
+        let proof = if final_rows {
+            reconstructed = proof.clone();
+            crate::proof_compression_plain::restore_final_rows::<PoseidonEngine<Ext>>(
+                &pcs.config,
+                &mut reconstructed,
+                challenger,
+            )?;
+            &reconstructed
+        } else {
+            proof
+        };
+        let verifier = WhirVerifier::new(&pcs.config, &pcs.mmcs, VariableOrder::Prefix);
+        verifier
+            .verify(
+                proof,
+                challenger,
+                &parsed.root,
+                initial_constraint,
+                claimed_eval,
+            )
+            .map(|_| ())
+            .map_err(|_| SpartanWhirError::WhirVerifyFailed)
+    }
+}
+
+impl<Ext> MlePcs<Poseidon1Engine<Ext>> for Plonky3WhirPcs
+where
+    Ext: ExtField + TwoAdicField,
+    Poseidon1Challenger: CanObserve<Poseidon1Commitment>
+        + CanSampleUniformBits<F>
+        + FieldChallenger<F>
+        + GrindingChallenger<Witness = F>,
+{
+    type Commitment = Poseidon1Commitment;
+    type ProverData = Poseidon1WhirProverData<Ext>;
+    type Proof = Poseidon1PlainWhirProof<Ext>;
+    type Config = WhirPcsConfig;
+
+    fn commit(
+        config: &Self::Config,
+        poly: &Evaluations<F>,
+        challenger: &mut Poseidon1Challenger,
+    ) -> Result<(Self::Commitment, Self::ProverData), SpartanWhirError> {
+        let _profile = profile_scope("pcs_commit_plain_poseidon1");
+        config.validate()?;
+        validate_polynomial_shape(poly, config.num_variables)?;
+
+        let pcs = build_poseidon1_plain_pcs::<Ext>(config)?;
+        observe_poseidon1_plain_domain_separator::<Ext>(&pcs, challenger);
+
+        let polynomial = Poly::new(poly.clone());
+        let (commitment, merkle_tree) = {
+            let _commit_profile = profile_scope("commit_base_plain_poseidon1");
+            commit_base(
+                VariableOrder::Prefix,
+                &pcs.dft,
+                &pcs.mmcs,
+                challenger,
+                &polynomial,
+                config.whir.first_folding_factor(),
+                config.whir.starting_log_inv_rate,
+            )
+        };
+
+        let mut initial_ood_answers = Vec::with_capacity(pcs.config.commitment_ood_samples);
+        let mut ood_pairs = Vec::with_capacity(pcs.config.commitment_ood_samples);
+        {
+            let _ood_profile = profile_scope("initial_ood_sampling_plain_poseidon1");
+            for _ in 0..pcs.config.commitment_ood_samples {
+                let point = Point::expand_from_univariate(
+                    challenger.sample_algebra_element(),
+                    config.num_variables,
+                );
+                let eval = polynomial.eval_base(&point);
+                challenger.observe_algebra_element(eval);
+                initial_ood_answers.push(eval);
+                ood_pairs.push((point.as_slice().to_vec(), eval));
+            }
+        }
+
+        Ok((
+            commitment.clone(),
+            Poseidon1WhirProverData {
+                commitment,
+                merkle_tree: Some(merkle_tree),
+                initial_ood_answers,
+                polynomial: poly.clone(),
+                ood_pairs,
+                num_variables: config.num_variables,
+            },
+        ))
+    }
+
+    fn open(
+        config: &Self::Config,
+        prover_data: Self::ProverData,
+        statement: &PcsStatement<Poseidon1Engine<Ext>>,
+        challenger: &mut Poseidon1Challenger,
+    ) -> Result<Self::Proof, SpartanWhirError> {
+        open_poseidon1_plain_without_commit_observation(
+            config,
+            prover_data,
+            statement,
+            false,
+            challenger,
+        )
+    }
+
+    fn verify(
+        config: &Self::Config,
+        commitment: &Self::Commitment,
+        statement: &PcsStatement<Poseidon1Engine<Ext>>,
+        proof: &Self::Proof,
+        challenger: &mut Poseidon1Challenger,
+    ) -> Result<(), SpartanWhirError> {
+        let parsed = <Self as ProtocolPcs<Poseidon1Engine<Ext>>>::verify_parse_commitment(
+            config, commitment, proof, challenger,
+        )?;
+        <Self as ProtocolPcs<Poseidon1Engine<Ext>>>::verify_finalize(
+            config, &parsed, statement, proof, challenger,
+        )
+    }
+}
+
+impl<Ext> ProtocolPcs<Poseidon1Engine<Ext>> for Plonky3WhirPcs
+where
+    Ext: ExtField + TwoAdicField,
+    Poseidon1Challenger: CanObserve<Poseidon1Commitment>
+        + CanSampleUniformBits<F>
+        + FieldChallenger<F>
+        + GrindingChallenger<Witness = F>,
+{
+    type ParsedCommitment = PlainParsedCommitment<Ext, Poseidon1Commitment>;
+
+    fn validate_spartan_config(
+        config: &WhirPcsConfig,
+        matrix_closing: MatrixClosingMode,
+        num_outer_rounds: usize,
+        num_inner_rounds: usize,
+    ) -> Result<(), SpartanWhirError> {
+        let _ = (matrix_closing, num_outer_rounds, num_inner_rounds);
+        build_poseidon1_plain_pcs::<Ext>(config).map(|_| ())
+    }
+
+    fn prepare_committed_opening(
+        config: &Self::Config,
+        mut prover_data: Self::ProverData,
+        challenger: &mut Poseidon1Challenger,
+    ) -> Result<Self::ProverData, SpartanWhirError> {
+        let _profile = profile_scope("prepare_committed_opening_plain_poseidon1");
+        config.validate()?;
+        if prover_data.num_variables != config.num_variables {
+            return Err(SpartanWhirError::InvalidNumVariables);
+        }
+        let pcs = build_poseidon1_plain_pcs::<Ext>(config)?;
+        observe_poseidon1_plain_domain_separator::<Ext>(&pcs, challenger);
+        challenger.observe(prover_data.commitment.clone());
+        let polynomial = Poly::new(prover_data.polynomial.clone());
+        if prover_data.merkle_tree.is_none() {
+            return Err(SpartanWhirError::invalid_config());
+        }
+
+        prover_data.initial_ood_answers.clear();
+        prover_data.ood_pairs.clear();
+        {
+            let _ood_profile = profile_scope("initial_ood_sampling_plain_poseidon1");
+            for _ in 0..pcs.config.commitment_ood_samples {
+                let point = Point::expand_from_univariate(
+                    challenger.sample_algebra_element(),
+                    config.num_variables,
+                );
+                let eval = polynomial.eval_base(&point);
+                challenger.observe_algebra_element(eval);
+                prover_data.initial_ood_answers.push(eval);
+                prover_data
+                    .ood_pairs
+                    .push((point.as_slice().to_vec(), eval));
+            }
+        }
+        Ok(prover_data)
+    }
+
+    fn verify_parse_commitment(
+        config: &Self::Config,
+        commitment: &Self::Commitment,
+        proof: &Self::Proof,
+        challenger: &mut Poseidon1Challenger,
+    ) -> Result<Self::ParsedCommitment, SpartanWhirError> {
+        let _profile = profile_scope("verify_parse_commitment_plain_poseidon1");
+        config.validate()?;
+        let pcs = build_poseidon1_plain_pcs::<Ext>(config)?;
+        validate_poseidon_commitment(commitment)?;
+        validate_poseidon1_plain_proof_commitments(proof)?;
+        observe_poseidon1_plain_domain_separator::<Ext>(&pcs, challenger);
+        challenger.observe(commitment.clone());
+        parse_poseidon1_plain_initial_commitment::<Ext>(
+            config.num_variables,
+            &pcs.config,
+            commitment,
+            proof,
+            challenger,
+        )
+    }
+
+    fn verify_finalize(
+        config: &Self::Config,
+        parsed: &Self::ParsedCommitment,
+        statement: &PcsStatement<Poseidon1Engine<Ext>>,
+        proof: &Self::Proof,
+        challenger: &mut Poseidon1Challenger,
+    ) -> Result<(), SpartanWhirError> {
+        <Self as ProtocolPcs<Poseidon1Engine<Ext>>>::verify_finalize_compressed(
+            config, parsed, statement, proof, false, challenger,
+        )
+    }
+
+    fn open_compressed(
+        config: &Self::Config,
+        prover_data: Self::ProverData,
+        statement: &PcsStatement<Poseidon1Engine<Ext>>,
+        final_rows: bool,
+        challenger: &mut Poseidon1Challenger,
+    ) -> Result<Self::Proof, SpartanWhirError> {
+        open_poseidon1_plain_without_commit_observation(
+            config,
+            prover_data,
+            statement,
+            final_rows,
+            challenger,
+        )
+    }
+
+    fn verify_finalize_compressed(
+        config: &Self::Config,
+        parsed: &Self::ParsedCommitment,
+        statement: &PcsStatement<Poseidon1Engine<Ext>>,
+        proof: &Self::Proof,
+        final_rows: bool,
+        challenger: &mut Poseidon1Challenger,
+    ) -> Result<(), SpartanWhirError> {
+        let _profile = profile_scope("verify_finalize_plain_poseidon1");
+        config.validate()?;
+        let pcs = build_poseidon1_plain_pcs::<Ext>(config)?;
+        let claims = statement_point_claims(statement, config.num_variables)?;
+        observe_statement_point_claims(&claims, challenger);
+        let mut eq_statement = EqStatement::initialize(config.num_variables);
+        for (point, eval) in claims {
+            eq_statement.add_evaluated_constraint(point, eval);
+        }
+        for (point, eval) in parsed.ood_statement.iter() {
+            eq_statement.add_evaluated_constraint(point.clone(), *eval);
+        }
+        let initial_constraint = Constraint::new(
+            challenger.sample_algebra_element(),
+            eq_statement.num_variables(),
+            vec![Statements::Eq(eq_statement)],
+        );
+        let mut claimed_eval = Ext::ZERO;
+        initial_constraint.combine_evals(&mut claimed_eval);
+
+        let mut reconstructed;
+        let proof = if final_rows {
+            reconstructed = proof.clone();
+            crate::proof_compression_plain::restore_final_rows::<Poseidon1Engine<Ext>>(
+                &pcs.config,
+                &mut reconstructed,
+                challenger,
+            )?;
+            &reconstructed
+        } else {
+            proof
+        };
         let verifier = WhirVerifier::new(&pcs.config, &pcs.mmcs, VariableOrder::Prefix);
         verifier
             .verify(
@@ -756,6 +1572,26 @@ where
         points: &[crate::MultilinearPoint<Ext>],
         challenger: &mut PoseidonChallenger,
     ) -> Result<(Self::Proof, Vec<Vec<Ext>>), SpartanWhirError> {
+        <Self as SparkReadPcs<PoseidonEngine<Ext>>>::open_read_table_compressed(
+            config,
+            prover_data,
+            column_count,
+            opening_columns,
+            points,
+            false,
+            challenger,
+        )
+    }
+
+    fn open_read_table_compressed(
+        config: &WhirPcsConfig,
+        prover_data: Self::ReadProverData,
+        column_count: usize,
+        opening_columns: &[Vec<usize>],
+        points: &[crate::MultilinearPoint<Ext>],
+        final_rows: bool,
+        challenger: &mut PoseidonChallenger,
+    ) -> Result<(Self::Proof, Vec<Vec<Ext>>), SpartanWhirError> {
         let _profile = profile_scope("spark_open_read_batch");
         let protocol = spark_read_opening_protocol(config, column_count, opening_columns)?;
         if points.len() != protocol.num_openings() {
@@ -766,14 +1602,26 @@ where
             .map(|point| Point::new(point.0.clone()))
             .collect::<Vec<_>>();
         let pcs = build_poseidon_spark_read_pcs::<Ext>(config)?;
-        let proof =
-            <PoseidonSparkReadPcs<Ext> as PrescribedPointPcs<Ext, PoseidonChallenger>>::open_at(
-                &pcs,
-                prover_data,
+        let replay = final_rows.then(|| PoseidonEngine::<Ext>::challenger_for_replay(challenger));
+        let mut proof = <PoseidonSparkReadPcs<Ext> as PrescribedPointPcs<
+            Ext,
+            PoseidonChallenger,
+        >>::open_at(&pcs, prover_data, &protocol, &points, challenger);
+        if let Some(replay) = replay {
+            let replay = crate::proof_compression_plain::read_whir_challenger::<PoseidonEngine<Ext>>(
+                &pcs.config,
+                &proof.whir,
                 &protocol,
                 &points,
-                challenger,
-            );
+                &proof.evals,
+                &replay,
+            )?;
+            crate::proof_compression_plain::compress_final_rows::<PoseidonEngine<Ext>>(
+                &pcs.config,
+                &mut proof.whir,
+                &replay,
+            )?;
+        }
         let evals = {
             let _profile = profile_scope("spark_read_batch_extract_evals");
             proof
@@ -815,6 +1663,30 @@ where
         evals: &[Vec<Ext>],
         challenger: &mut PoseidonChallenger,
     ) -> Result<(), SpartanWhirError> {
+        <Self as SparkReadPcs<PoseidonEngine<Ext>>>::verify_finalize_read_table_compressed(
+            config,
+            parsed,
+            proof,
+            column_count,
+            opening_columns,
+            points,
+            evals,
+            false,
+            challenger,
+        )
+    }
+
+    fn verify_finalize_read_table_compressed(
+        config: &WhirPcsConfig,
+        parsed: &Self::ParsedReadCommitment,
+        proof: &Self::Proof,
+        column_count: usize,
+        opening_columns: &[Vec<usize>],
+        points: &[crate::MultilinearPoint<Ext>],
+        evals: &[Vec<Ext>],
+        final_rows: bool,
+        challenger: &mut PoseidonChallenger,
+    ) -> Result<(), SpartanWhirError> {
         let _profile = profile_scope("spark_verify_read_batch");
         let protocol = spark_read_opening_protocol(config, column_count, opening_columns)?;
         if points.len() != protocol.num_openings()
@@ -832,8 +1704,9 @@ where
             .collect::<Vec<_>>();
         let pcs = build_poseidon_spark_read_pcs::<Ext>(config)?;
         validate_poseidon_commitment(parsed)?;
-        validate_poseidon_plain_proof_shape(&pcs.config, proof)?;
-        let proof = PcsProof {
+        validate_poseidon_plain_proof_shape_compressed(&pcs.config, proof, final_rows, false)?;
+
+        let mut proof = PcsProof {
             whir: proof.clone(),
             evals: evals
                 .iter()
@@ -841,7 +1714,250 @@ where
                 .map(|batch| OpeningBatch::new(batch, Vec::new()))
                 .collect(),
         };
+        if final_rows {
+            let replay = crate::proof_compression_plain::read_whir_challenger::<PoseidonEngine<Ext>>(
+                &pcs.config,
+                &proof.whir,
+                &protocol,
+                &points,
+                &proof.evals,
+                challenger,
+            )?;
+            crate::proof_compression_plain::restore_final_rows::<PoseidonEngine<Ext>>(
+                &pcs.config,
+                &mut proof.whir,
+                &replay,
+            )?;
+            validate_poseidon_plain_proof_shape(&pcs.config, &proof.whir)?;
+        }
         <PoseidonSparkReadPcs<Ext> as PrescribedPointPcs<Ext, PoseidonChallenger>>::verify_at(
+            &pcs, parsed, &proof, &protocol, &points, challenger,
+        )
+        .map(|_| ())
+        .map_err(|_| SpartanWhirError::WhirVerifyFailed)
+    }
+}
+
+impl<Ext> SparkReadPcs<Poseidon1Engine<Ext>> for Plonky3WhirPcs
+where
+    Ext: ExtField + TwoAdicField,
+    Poseidon1Challenger: CanObserve<Poseidon1Commitment>
+        + CanSampleUniformBits<F>
+        + FieldChallenger<F>
+        + GrindingChallenger<Witness = F>,
+{
+    type ReadProverData = Poseidon1SparkReadProverData<Ext>;
+    type ParsedReadCommitment = Poseidon1Commitment;
+
+    fn commit_read_table(
+        config: &WhirPcsConfig,
+        coordinate_columns: Evaluations<F>,
+        domain_size: usize,
+        column_count: usize,
+        challenger: &mut Poseidon1Challenger,
+    ) -> Result<(Self::Commitment, Self::ReadProverData), SpartanWhirError> {
+        let _profile = profile_scope("spark_commit_read_batch_poseidon1");
+        let expected_len = domain_size
+            .checked_mul(column_count)
+            .ok_or_else(SpartanWhirError::invalid_config)?;
+        if domain_size == 0
+            || !domain_size.is_power_of_two()
+            || column_count == 0
+            || !column_count.is_power_of_two()
+            || coordinate_columns.len() != expected_len
+        {
+            return Err(SpartanWhirError::InvalidPolynomialLength);
+        }
+        validate_spark_read_batch_config(config, domain_size.ilog2() as usize, column_count)?;
+
+        let table = {
+            let _profile = profile_scope("spark_read_batch_pack_poseidon1");
+            Table::new(RowMajorMatrix::new(coordinate_columns, domain_size))
+        };
+        let pcs = build_poseidon1_spark_read_pcs::<Ext>(config)?;
+        observe_poseidon1_plain_domain_separator::<Ext>(&pcs, challenger);
+        let (commitment, prover_data) = {
+            let _profile = profile_scope("spark_read_batch_commit_poseidon1");
+            let witness = <PrefixProver<F, Ext> as Layout<F, Ext>>::new_witness(
+                vec![table],
+                config.whir.first_folding_factor(),
+            );
+            <Poseidon1SparkReadPcs<Ext> as MultilinearPcs<Ext, Poseidon1Challenger>>::commit(
+                &pcs, witness, challenger,
+            )
+        };
+        Ok((commitment, prover_data))
+    }
+
+    fn open_read_table(
+        config: &WhirPcsConfig,
+        prover_data: Self::ReadProverData,
+        column_count: usize,
+        opening_columns: &[Vec<usize>],
+        points: &[crate::MultilinearPoint<Ext>],
+        challenger: &mut Poseidon1Challenger,
+    ) -> Result<(Self::Proof, Vec<Vec<Ext>>), SpartanWhirError> {
+        <Self as SparkReadPcs<Poseidon1Engine<Ext>>>::open_read_table_compressed(
+            config,
+            prover_data,
+            column_count,
+            opening_columns,
+            points,
+            false,
+            challenger,
+        )
+    }
+
+    fn open_read_table_compressed(
+        config: &WhirPcsConfig,
+        prover_data: Self::ReadProverData,
+        column_count: usize,
+        opening_columns: &[Vec<usize>],
+        points: &[crate::MultilinearPoint<Ext>],
+        final_rows: bool,
+        challenger: &mut Poseidon1Challenger,
+    ) -> Result<(Self::Proof, Vec<Vec<Ext>>), SpartanWhirError> {
+        let _profile = profile_scope("spark_open_read_batch_poseidon1");
+        let protocol = spark_read_opening_protocol(config, column_count, opening_columns)?;
+        if points.len() != protocol.num_openings() {
+            return Err(SpartanWhirError::invalid_config());
+        }
+        let points = points
+            .iter()
+            .map(|point| Point::new(point.0.clone()))
+            .collect::<Vec<_>>();
+        let pcs = build_poseidon1_spark_read_pcs::<Ext>(config)?;
+        let replay = final_rows.then(|| Poseidon1Engine::<Ext>::challenger_for_replay(challenger));
+        let mut proof = <Poseidon1SparkReadPcs<Ext> as PrescribedPointPcs<
+            Ext,
+            Poseidon1Challenger,
+        >>::open_at(&pcs, prover_data, &protocol, &points, challenger);
+        if let Some(replay) = replay {
+            let replay =
+                crate::proof_compression_plain::read_whir_challenger::<Poseidon1Engine<Ext>>(
+                    &pcs.config,
+                    &proof.whir,
+                    &protocol,
+                    &points,
+                    &proof.evals,
+                    &replay,
+                )?;
+            crate::proof_compression_plain::compress_final_rows::<Poseidon1Engine<Ext>>(
+                &pcs.config,
+                &mut proof.whir,
+                &replay,
+            )?;
+        }
+        let evals = {
+            let _profile = profile_scope("spark_read_batch_extract_evals_poseidon1");
+            proof
+                .evals
+                .iter()
+                .map(|batch| {
+                    if !batch.next().is_empty() {
+                        return Err(SpartanWhirError::invalid_config());
+                    }
+                    Ok(batch.current().to_vec())
+                })
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        Ok((proof.whir, evals))
+    }
+
+    fn verify_parse_read_commitment(
+        config: &WhirPcsConfig,
+        commitment: &Self::Commitment,
+        proof: &Self::Proof,
+        challenger: &mut Poseidon1Challenger,
+    ) -> Result<Self::ParsedReadCommitment, SpartanWhirError> {
+        let _profile = profile_scope("spark_parse_read_batch_poseidon1");
+        let pcs = build_poseidon1_spark_read_pcs::<Ext>(config)?;
+        validate_poseidon_commitment(commitment)?;
+        validate_poseidon1_plain_proof_commitments(proof)?;
+        observe_poseidon1_plain_domain_separator::<Ext>(&pcs, challenger);
+        challenger.observe(commitment.clone());
+        Ok(commitment.clone())
+    }
+
+    fn verify_finalize_read_table(
+        config: &WhirPcsConfig,
+        parsed: &Self::ParsedReadCommitment,
+        proof: &Self::Proof,
+        column_count: usize,
+        opening_columns: &[Vec<usize>],
+        points: &[crate::MultilinearPoint<Ext>],
+        evals: &[Vec<Ext>],
+        challenger: &mut Poseidon1Challenger,
+    ) -> Result<(), SpartanWhirError> {
+        <Self as SparkReadPcs<Poseidon1Engine<Ext>>>::verify_finalize_read_table_compressed(
+            config,
+            parsed,
+            proof,
+            column_count,
+            opening_columns,
+            points,
+            evals,
+            false,
+            challenger,
+        )
+    }
+
+    fn verify_finalize_read_table_compressed(
+        config: &WhirPcsConfig,
+        parsed: &Self::ParsedReadCommitment,
+        proof: &Self::Proof,
+        column_count: usize,
+        opening_columns: &[Vec<usize>],
+        points: &[crate::MultilinearPoint<Ext>],
+        evals: &[Vec<Ext>],
+        final_rows: bool,
+        challenger: &mut Poseidon1Challenger,
+    ) -> Result<(), SpartanWhirError> {
+        let _profile = profile_scope("spark_verify_read_batch_poseidon1");
+        let protocol = spark_read_opening_protocol(config, column_count, opening_columns)?;
+        if points.len() != protocol.num_openings()
+            || evals.len() != protocol.num_openings()
+            || evals
+                .iter()
+                .zip(opening_columns)
+                .any(|(batch, columns)| batch.len() != columns.len())
+        {
+            return Err(SpartanWhirError::invalid_config());
+        }
+        let points = points
+            .iter()
+            .map(|point| Point::new(point.0.clone()))
+            .collect::<Vec<_>>();
+        let pcs = build_poseidon1_spark_read_pcs::<Ext>(config)?;
+        validate_poseidon_commitment(parsed)?;
+        validate_poseidon1_plain_proof_shape_compressed(&pcs.config, proof, final_rows, false)?;
+
+        let mut proof = PcsProof {
+            whir: proof.clone(),
+            evals: evals
+                .iter()
+                .cloned()
+                .map(|batch| OpeningBatch::new(batch, Vec::new()))
+                .collect(),
+        };
+        if final_rows {
+            let replay =
+                crate::proof_compression_plain::read_whir_challenger::<Poseidon1Engine<Ext>>(
+                    &pcs.config,
+                    &proof.whir,
+                    &protocol,
+                    &points,
+                    &proof.evals,
+                    challenger,
+                )?;
+            crate::proof_compression_plain::restore_final_rows::<Poseidon1Engine<Ext>>(
+                &pcs.config,
+                &mut proof.whir,
+                &replay,
+            )?;
+            validate_poseidon1_plain_proof_shape(&pcs.config, &proof.whir)?;
+        }
+        <Poseidon1SparkReadPcs<Ext> as PrescribedPointPcs<Ext, Poseidon1Challenger>>::verify_at(
             &pcs, parsed, &proof, &protocol, &points, challenger,
         )
         .map(|_| ())
@@ -1383,6 +2499,7 @@ fn open_plain_without_commit_observation<Ext>(
     config: &WhirPcsConfig,
     prover_data: Plonky3WhirProverData<Ext>,
     statement: &PcsStatement<PoseidonEngine<Ext>>,
+    final_rows: bool,
     challenger: &mut PoseidonChallenger,
 ) -> Result<PoseidonPlainWhirProof<Ext>, SpartanWhirError>
 where
@@ -1409,6 +2526,11 @@ where
     // of the claimed values, and a malicious prover can pick false openings
     // whose batched combination cancels while each opening is wrong.
     observe_statement_point_claims(&claims, challenger);
+    let replay = final_rows.then(|| {
+        let mut replay = PoseidonEngine::<Ext>::challenger_for_replay(challenger);
+        let _: Ext = replay.sample_algebra_element();
+        replay
+    });
     claims.extend(
         prover_data
             .ood_pairs
@@ -1425,25 +2547,96 @@ where
     let merkle_tree = prover_data
         .merkle_tree
         .ok_or(SpartanWhirError::invalid_config())?;
-    let proof = {
+    let mut proof = {
         let _prove_profile = profile_scope("p3_whir_prove_plain");
         pcs.prove(initial_ood_answers, challenger, layout, merkle_tree)
     };
+    if let Some(replay) = replay {
+        crate::proof_compression_plain::compress_final_rows::<PoseidonEngine<Ext>>(
+            &pcs.config,
+            &mut proof,
+            &replay,
+        )?;
+    }
     Ok(proof)
 }
 
-pub(crate) fn build_poseidon_full_zk_pcs<Ext>(
+fn open_poseidon1_plain_without_commit_observation<Ext>(
+    config: &WhirPcsConfig,
+    prover_data: Poseidon1WhirProverData<Ext>,
+    statement: &PcsStatement<Poseidon1Engine<Ext>>,
+    final_rows: bool,
+    challenger: &mut Poseidon1Challenger,
+) -> Result<Poseidon1PlainWhirProof<Ext>, SpartanWhirError>
+where
+    Ext: ExtField + TwoAdicField,
+    Poseidon1Challenger: CanObserve<Poseidon1Commitment>
+        + CanSampleUniformBits<F>
+        + FieldChallenger<F>
+        + GrindingChallenger<Witness = F>,
+{
+    let _profile = profile_scope("pcs_open_plain_poseidon1");
+    config.validate()?;
+    if prover_data.num_variables != config.num_variables {
+        return Err(SpartanWhirError::InvalidNumVariables);
+    }
+    #[cfg(debug_assertions)]
+    {
+        let _validate_profile = profile_scope("validate_user_point_claims_plain_poseidon1");
+        validate_user_point_claims(statement, &prover_data.polynomial, config.num_variables)?;
+    }
+    let pcs = build_poseidon1_plain_pcs::<Ext>(config)?;
+    let mut claims = statement_point_claims(statement, config.num_variables)?;
+    observe_statement_point_claims(&claims, challenger);
+    let replay = final_rows.then(|| {
+        let mut replay = Poseidon1Engine::<Ext>::challenger_for_replay(challenger);
+        let _: Ext = replay.sample_algebra_element();
+        replay
+    });
+    claims.extend(
+        prover_data
+            .ood_pairs
+            .iter()
+            .map(|(point, eval)| (Point::new(point.clone()), *eval)),
+    );
+    let layout = SpartanEqLayout {
+        polynomial: Poly::new(prover_data.polynomial),
+        claims,
+        folding: config.whir.first_folding_factor(),
+        num_variables: config.num_variables,
+    };
+    let initial_ood_answers = prover_data.initial_ood_answers;
+    let merkle_tree = prover_data
+        .merkle_tree
+        .ok_or(SpartanWhirError::invalid_config())?;
+    let mut proof = {
+        let _prove_profile = profile_scope("p3_whir_prove_plain_poseidon1");
+        pcs.prove(initial_ood_answers, challenger, layout, merkle_tree)
+    };
+    if let Some(replay) = replay {
+        crate::proof_compression_plain::compress_final_rows::<Poseidon1Engine<Ext>>(
+            &pcs.config,
+            &mut proof,
+            &replay,
+        )?;
+    }
+    Ok(proof)
+}
+
+pub(crate) fn build_poseidon_full_zk_pcs<E>(
     config: &ZkWhirPcsConfig,
     num_outer_rounds: usize,
     num_inner_rounds: usize,
     requested_security_bits: u32,
-) -> Result<(PoseidonHidingPcs<Ext>, [MaskGroupShape; 3]), SpartanWhirError>
+) -> Result<(PoseidonZkHidingPcsFor<E>, [MaskGroupShape; 3]), SpartanWhirError>
 where
-    Ext: ExtField,
-    StandardUniform: Distribution<Ext>,
+    E: FullZkPoseidonEngine,
+    E::EF: ExtField,
+    E::Challenger: FieldChallenger<F> + GrindingChallenger<Witness = F>,
+    StandardUniform: Distribution<E::EF>,
 {
     config.validate()?;
-    validate_full_zk_security::<Ext>(
+    validate_full_zk_security::<E::EF>(
         config,
         num_outer_rounds,
         num_inner_rounds,
@@ -1456,8 +2649,28 @@ where
         .security_level_bits
         .checked_add(FULL_ZK_SECURITY_SLACK_BITS)
         .ok_or_else(SpartanWhirError::invalid_config)?;
-    let pcs = build_poseidon_hiding_pcs::<Ext>(config, relation_security_level)?;
-    let shapes = application_relation_shapes::<Ext>(&pcs, num_outer_rounds, num_inner_rounds)?;
+    let pcs = build_poseidon_hiding_pcs::<E>(config, relation_security_level)?;
+    let shapes = application_relation_shapes::<E>(&pcs, num_outer_rounds, num_inner_rounds)?;
+    let application = crate::protocol::combined_application_mask_shape(
+        shapes[0],
+        shapes[1],
+        config.mask_packing,
+    )?;
+    for group in pcs
+        .config
+        .mask_groups()
+        .into_iter()
+        .chain([application, shapes[2]])
+    {
+        if group.shape.domain_size.ilog2() as usize > E::EF::TWO_ADICITY {
+            return Err(SpartanWhirError::invalid_config_reason(
+                InvalidConfigReason::ZkWhirMaskDomainExceedsTwoAdicity {
+                    log_domain_size: group.shape.domain_size.ilog2() as usize,
+                    two_adicity: E::EF::TWO_ADICITY,
+                },
+            ));
+        }
+    }
     Ok((pcs, shapes))
 }
 
@@ -1512,14 +2725,16 @@ where
     Ok(())
 }
 
-fn application_relation_shapes<Ext>(
-    pcs: &PoseidonHidingPcs<Ext>,
+fn application_relation_shapes<E>(
+    pcs: &PoseidonZkHidingPcsFor<E>,
     num_outer_rounds: usize,
     num_inner_rounds: usize,
 ) -> Result<[MaskGroupShape; 3], SpartanWhirError>
 where
-    Ext: ExtField,
-    StandardUniform: Distribution<Ext>,
+    E: FullZkPoseidonEngine,
+    E::EF: ExtField,
+    E::Challenger: FieldChallenger<F> + GrindingChallenger<Witness = F>,
+    StandardUniform: Distribution<E::EF>,
 {
     let randomness_len = pcs.config.mask_queries;
     let log_inv_rate = pcs.config.zk.mask_log_inv_rate;
@@ -1528,17 +2743,14 @@ where
         .ok_or_else(SpartanWhirError::invalid_config)?;
     Ok([
         MaskGroupShape {
-            shape: checked_mask_code_shape::<Ext>(4, randomness_len, log_inv_rate)?,
+            shape: checked_mask_code_shape::<E::EF>(4, randomness_len, log_inv_rate)?,
             width: inner_width,
         },
         MaskGroupShape {
-            shape: checked_mask_code_shape::<Ext>(8, randomness_len, log_inv_rate)?,
+            shape: checked_mask_code_shape::<E::EF>(8, randomness_len, log_inv_rate)?,
             width: num_outer_rounds,
         },
-        MaskGroupShape {
-            shape: pcs.config.sumcheck_mask,
-            width: num_inner_rounds,
-        },
+        pcs.config.sumcheck_mask_group(num_inner_rounds),
     ])
 }
 
@@ -1666,13 +2878,15 @@ where
     Ok(())
 }
 
-pub(crate) fn build_poseidon_hiding_pcs<Ext>(
+pub(crate) fn build_poseidon_hiding_pcs<E>(
     config: &ZkWhirPcsConfig,
     relation_security_level: u32,
-) -> Result<PoseidonHidingPcs<Ext>, SpartanWhirError>
+) -> Result<PoseidonZkHidingPcsFor<E>, SpartanWhirError>
 where
-    Ext: ExtField,
-    StandardUniform: Distribution<Ext>,
+    E: FullZkPoseidonEngine,
+    E::EF: ExtField,
+    E::Challenger: FieldChallenger<F> + GrindingChallenger<Witness = F>,
+    StandardUniform: Distribution<E::EF>,
 {
     let _profile = profile_scope("build_poseidon_hiding_pcs");
     config.validate()?;
@@ -1691,7 +2905,7 @@ where
         security_level: relation_security_level as usize,
         pow_bits: base.whir.pow_bits as usize,
     };
-    let mut whir_config = ZkWhirConfig::<Ext, F, PoseidonChallenger>::new(
+    let mut whir_config = ZkWhirConfig::<E::EF, F, E::Challenger>::new(
         base.num_variables,
         protocol_params,
         ZkParameters {
@@ -1700,12 +2914,12 @@ where
         },
     )
     .map_err(map_zk_config_error)?;
+    whir_config = whir_config
+        .with_fresh_mask_batching(config.fresh_mask_batching)
+        .with_sumcheck_mask_packing(config.mask_packing.sumchecks())
+        .map_err(map_zk_config_error)?;
     apply_hiding_terminal_budget(&mut whir_config)?;
-    let mmcs = RcMmcs(InnerPoseidonMmcs::new(
-        poseidon_merkle_hash(),
-        poseidon_merkle_compress(),
-        0,
-    ));
+    let mmcs = E::full_zk_mmcs();
     Ok(HidingWhirPcs::new(
         whir_config,
         shared_poseidon_dft(),
@@ -1776,13 +2990,77 @@ where
     Ok((whir_config, shared_poseidon_dft(), mmcs))
 }
 
-pub(crate) fn observe_poseidon_relation_domain_separator<Ext>(
-    pcs: &PoseidonHidingPcs<Ext>,
+fn build_poseidon1_plain_pcs<Ext>(
+    config: &WhirPcsConfig,
+) -> Result<Poseidon1PlainPcs<Ext>, SpartanWhirError>
+where
+    Ext: ExtField + TwoAdicField,
+{
+    let (whir_config, dft, mmcs) = build_poseidon1_plain_pcs_parts::<Ext>(config)?;
+    Ok(WhirProver::new(whir_config, dft, mmcs))
+}
+
+fn build_poseidon1_spark_read_pcs<Ext>(
+    config: &WhirPcsConfig,
+) -> Result<Poseidon1SparkReadPcs<Ext>, SpartanWhirError>
+where
+    Ext: ExtField + TwoAdicField,
+{
+    let (whir_config, dft, mmcs) = build_poseidon1_plain_pcs_parts::<Ext>(config)?;
+    Ok(WhirProver::new(whir_config, dft, mmcs))
+}
+
+fn build_poseidon1_plain_pcs_parts<Ext>(
+    config: &WhirPcsConfig,
+) -> Result<
+    (
+        Poseidon1PlainWhirConfig<Ext>,
+        Radix2DFTSmallBatch<F>,
+        Poseidon1Mmcs,
+    ),
+    SpartanWhirError,
+>
+where
+    Ext: ExtField + TwoAdicField,
+{
+    let _profile = profile_scope("build_poseidon1_plain_pcs");
+    config.validate()?;
+    let protocol_params = ProtocolParameters {
+        starting_log_inv_rate: config.whir.starting_log_inv_rate,
+        round_log_inv_rates: poseidon_round_log_inv_rates(
+            config.num_variables,
+            &config.whir.effective_folding_schedule(),
+            config.whir.starting_log_inv_rate,
+            config.whir.rs_domain_initial_reduction_factor,
+            &config.whir.round_log_inv_rates,
+        )?,
+        folding_factor: map_poseidon_folding_schedule(&config.whir.effective_folding_schedule()),
+        soundness_type: map_soundness_assumption(config.security.soundness_assumption),
+        security_level: config.security.security_level_bits as usize,
+        pow_bits: config.whir.pow_bits as usize,
+    };
+    let whir_config = Plonky3PlainWhirConfig::<Ext, F, Poseidon1Challenger>::new(
+        config.num_variables,
+        protocol_params,
+    )
+    .map_err(|_| SpartanWhirError::invalid_config())?;
+    let mmcs = RcMmcs(InnerPoseidon1Mmcs::new(
+        poseidon1_merkle_hash(),
+        poseidon1_merkle_compress(),
+        0,
+    ));
+    Ok((whir_config, shared_poseidon_dft(), mmcs))
+}
+
+pub(crate) fn observe_poseidon_relation_domain_separator<E>(
+    pcs: &PoseidonZkHidingPcsFor<E>,
     mask_groups: &[p3_whir::pcs::zk::MaskGroupShape],
-    challenger: &mut PoseidonChallenger,
+    challenger: &mut E::Challenger,
 ) where
-    Ext: ExtField,
-    StandardUniform: Distribution<Ext>,
+    E: FullZkPoseidonEngine,
+    E::EF: ExtField,
+    E::Challenger: FieldChallenger<F> + GrindingChallenger<Witness = F>,
+    StandardUniform: Distribution<E::EF>,
 {
     let mut domain_separator = WhirDomainSeparator::new(Vec::new());
     pcs.add_relation_domain_separator::<8>(&mut domain_separator, mask_groups);
@@ -1805,6 +3083,64 @@ fn observe_poseidon_plain_domain_separator<Ext>(
     let mut domain_separator = WhirDomainSeparator::new(Vec::new());
     pcs.add_domain_separator::<8>(&mut domain_separator);
     domain_separator.observe_domain_separator(challenger);
+}
+
+fn observe_poseidon1_plain_domain_separator<Ext>(
+    pcs: &WhirProver<
+        Ext,
+        F,
+        Radix2DFTSmallBatch<F>,
+        Poseidon1Mmcs,
+        Poseidon1Challenger,
+        impl Layout<F, Ext>,
+    >,
+    challenger: &mut Poseidon1Challenger,
+) where
+    Ext: ExtField + TwoAdicField,
+{
+    let mut domain_separator = WhirDomainSeparator::new(Vec::new());
+    pcs.add_domain_separator::<8>(&mut domain_separator);
+    domain_separator.observe_domain_separator(challenger);
+}
+
+pub(crate) fn poseidon_plain_whir_guest_config_parts<Ext>(
+    config: &WhirPcsConfig,
+) -> Result<(PoseidonPlainWhirConfig<Ext>, Vec<u32>), SpartanWhirError>
+where
+    Ext: ExtField + TwoAdicField,
+{
+    let pcs = build_poseidon_plain_pcs::<Ext>(config)?;
+    let mut challenger = crate::engine::poseidon_challenger().with_trace();
+    observe_poseidon_plain_domain_separator(&pcs, &mut challenger);
+    let domain_separator = challenger
+        .transcript_trace()
+        .into_iter()
+        .find_map(|event| match event {
+            crate::PoseidonTranscriptEvent::Observe { values } => Some(values),
+            _ => None,
+        })
+        .ok_or_else(SpartanWhirError::invalid_config)?;
+    Ok((pcs.config.clone(), domain_separator))
+}
+
+pub(crate) fn poseidon1_plain_whir_guest_config_parts<Ext>(
+    config: &WhirPcsConfig,
+) -> Result<(Poseidon1PlainWhirConfig<Ext>, Vec<u32>), SpartanWhirError>
+where
+    Ext: ExtField + TwoAdicField,
+{
+    let pcs = build_poseidon1_plain_pcs::<Ext>(config)?;
+    let mut challenger = poseidon1_challenger().with_trace();
+    observe_poseidon1_plain_domain_separator(&pcs, &mut challenger);
+    let domain_separator = challenger
+        .transcript_trace()
+        .into_iter()
+        .find_map(|event| match event {
+            crate::PoseidonTranscriptEvent::Observe { values } => Some(values),
+            _ => None,
+        })
+        .ok_or_else(SpartanWhirError::invalid_config)?;
+    Ok((pcs.config.clone(), domain_separator))
 }
 
 fn parse_plain_initial_commitment<Ext>(
@@ -1837,6 +3173,36 @@ where
     })
 }
 
+fn parse_poseidon1_plain_initial_commitment<Ext>(
+    num_variables: usize,
+    whir_config: &Poseidon1PlainWhirConfig<Ext>,
+    commitment: &Poseidon1Commitment,
+    proof: &Poseidon1PlainWhirProof<Ext>,
+    challenger: &mut Poseidon1Challenger,
+) -> Result<PlainParsedCommitment<Ext, Poseidon1Commitment>, SpartanWhirError>
+where
+    Ext: ExtField + TwoAdicField,
+    Poseidon1Challenger: CanObserve<Poseidon1Commitment>
+        + CanSampleUniformBits<F>
+        + FieldChallenger<F>
+        + GrindingChallenger<Witness = F>,
+{
+    if proof.initial_ood_answers.len() != whir_config.commitment_ood_samples {
+        return Err(SpartanWhirError::invalid_config());
+    }
+    let mut ood_statement = EqStatement::initialize(num_variables);
+    for &eval in &proof.initial_ood_answers {
+        let point =
+            Point::expand_from_univariate(challenger.sample_algebra_element(), num_variables);
+        challenger.observe_algebra_element(eval);
+        ood_statement.add_evaluated_constraint(point, eval);
+    }
+    Ok(PlainParsedCommitment {
+        root: commitment.clone(),
+        ood_statement,
+    })
+}
+
 /// Absorb the statement's claimed opening points and values into the
 /// transcript.
 ///
@@ -1845,11 +3211,12 @@ where
 /// transcript position, directly before that challenge is sampled. The
 /// commitment OOD claims are excluded because the commit phase already
 /// absorbed them.
-fn observe_statement_point_claims<Ext>(
+pub(crate) fn observe_statement_point_claims<Ext, Challenger>(
     claims: &[(Point<Ext>, Ext)],
-    challenger: &mut PoseidonChallenger,
+    challenger: &mut Challenger,
 ) where
     Ext: ExtField,
+    Challenger: FieldChallenger<F>,
 {
     challenger.observe(F::from_usize(claims.len()));
     for (point, value) in claims {
@@ -1858,12 +3225,13 @@ fn observe_statement_point_claims<Ext>(
     }
 }
 
-fn statement_point_claims<Ext>(
-    statement: &PcsStatement<PoseidonEngine<Ext>>,
+pub(crate) fn statement_point_claims<E, Ext>(
+    statement: &PcsStatement<E>,
     num_variables: usize,
 ) -> Result<Vec<(Point<Ext>, Ext)>, SpartanWhirError>
 where
     Ext: ExtField,
+    E: SpartanWhirEngine<F = F, EF = Ext>,
 {
     if !statement.linear_constraints().is_empty() {
         return Err(SpartanWhirError::UnsupportedStatementType);
@@ -1881,13 +3249,14 @@ where
 }
 
 #[cfg(debug_assertions)]
-fn validate_user_point_claims<Ext>(
-    statement: &PcsStatement<PoseidonEngine<Ext>>,
+fn validate_user_point_claims<E, Ext>(
+    statement: &PcsStatement<E>,
     polynomial: &[F],
     num_variables: usize,
 ) -> Result<(), SpartanWhirError>
 where
     Ext: ExtField,
+    E: SpartanWhirEngine<F = F, EF = Ext>,
 {
     let poly = Poly::new(polynomial.to_vec());
     for (point, value) in statement_point_claims(statement, num_variables)? {
@@ -2120,18 +3489,17 @@ mod pcs_transcript_tests {
             whir: recommended_octic_zk_whir_params(20),
         };
         let zk = ZkWhirPcsConfig {
+            fresh_mask_batching: crate::pcs_config::FreshMaskBatching::Separate,
+            mask_packing: crate::pcs_config::MaskPacking::Off,
             base: base.clone(),
             ell_zk: DEFAULT_ZK_ELL,
             mask_log_inv_rate: DEFAULT_ZK_MASK_LOG_INV_RATE,
         };
         let plain = build_poseidon_plain_pcs::<OcticBinExtension>(&base)
             .expect("plain PCS config is valid");
-        let (hiding, relation_shapes) = build_poseidon_full_zk_pcs::<OcticBinExtension>(
-            &zk,
-            19,
-            21,
-            zk.base.security.security_level_bits,
-        )
+        let (hiding, relation_shapes) = build_poseidon_full_zk_pcs::<
+            PoseidonEngine<OcticBinExtension>,
+        >(&zk, 19, 21, zk.base.security.security_level_bits)
         .expect("hiding relation PCS config is valid");
 
         let mut plain_challenger = crate::poseidon_challenger();
@@ -2139,7 +3507,7 @@ mod pcs_transcript_tests {
         let plain_challenge = plain_challenger.sample_algebra_element::<OcticBinExtension>();
 
         let mut relation_challenger = crate::poseidon_challenger();
-        observe_poseidon_relation_domain_separator(
+        observe_poseidon_relation_domain_separator::<PoseidonEngine<OcticBinExtension>>(
             &hiding,
             &relation_shapes,
             &mut relation_challenger,

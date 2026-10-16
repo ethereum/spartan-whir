@@ -12,12 +12,23 @@ use p3_commit::Mmcs;
 use p3_dft::{Radix2DFTSmallBatch, TwoAdicSubgroupDft};
 use p3_field::{Field, PrimeCharacteristicRing};
 use p3_matrix::dense::RowMajorMatrix;
+use p3_maybe_rayon::prelude::current_num_threads;
 use p3_merkle_tree::MerkleTreeMmcs;
+use p3_symmetric::{CryptographicHasher, PseudoCompressionFunction};
 use serde::Serialize;
+use spartan_whir::{engine::F, OcticBinExtension, QuarticBinExtension, QuinticExtension};
+
+#[cfg(feature = "poseidon1")]
 use spartan_whir::{
-    engine::F, poseidon_challenger, poseidon_merkle_compress, poseidon_merkle_hash,
-    OcticBinExtension, PoseidonFieldHash, PoseidonNodeCompress, QuarticBinExtension,
-    QuinticExtension,
+    poseidon1_challenger as poseidon_challenger,
+    poseidon1_merkle_compress as poseidon_merkle_compress,
+    poseidon1_merkle_hash as poseidon_merkle_hash, Poseidon1FieldHash as PoseidonFieldHash,
+    Poseidon1NodeCompress as PoseidonNodeCompress,
+};
+#[cfg(not(feature = "poseidon1"))]
+use spartan_whir::{
+    poseidon_challenger, poseidon_merkle_compress, poseidon_merkle_hash, PoseidonFieldHash,
+    PoseidonNodeCompress,
 };
 
 mod poseidon_schedule_support;
@@ -63,9 +74,12 @@ struct Calibration {
     units: &'static str,
     build_profile: String,
     target_cpu_native: bool,
+    rayon_threads: usize,
     features: String,
+    hash_profile: &'static str,
     args: CalibrationArgs,
     coefficients: Coefficients,
+    verifier_coefficients: VerifierCoefficients,
     measurements: Measurements,
     validation: Validation,
 }
@@ -101,6 +115,18 @@ struct Measurements {
     row_opening: Vec<PointMeasurement>,
     sumcheck: SumcheckMeasurements,
     pow: PointMeasurement,
+    verifier_merkle_hash: PointMeasurement,
+    verifier_leaf_hash: Vec<PointMeasurement>,
+}
+
+#[derive(Debug, Serialize)]
+struct VerifierCoefficients {
+    fixed_overhead: f64,
+    merkle_hash: f64,
+    leaf_field_element: f64,
+    row_field_element: f64,
+    extension_operation: SumcheckCoefficients,
+    pow_check: f64,
 }
 
 #[derive(Debug, Serialize)]
@@ -167,6 +193,14 @@ fn main() {
         ),
     };
     let pow = measure_pow(args.pow_attempts_log2, args.repeats);
+    let verifier_merkle_hash = measure_verifier_merkle_hash(
+        args.row_openings.saturating_mul(args.max_log_size),
+        args.repeats,
+    );
+    let verifier_leaf_hash = [8usize, 16, 32, 64, 128]
+        .into_iter()
+        .map(|width| measure_verifier_leaf_hash(width, args.row_openings, args.repeats))
+        .collect::<Vec<_>>();
 
     let coefficients = Coefficients {
         fixed_overhead: 0.0,
@@ -182,9 +216,21 @@ fn main() {
         },
         pow: pow.seconds_per_unit,
     };
+    let verifier_coefficients = VerifierCoefficients {
+        fixed_overhead: 0.0,
+        merkle_hash: verifier_merkle_hash.seconds_per_unit,
+        leaf_field_element: median_seconds_per_unit(&verifier_leaf_hash),
+        row_field_element: median_seconds_per_unit(&row_opening),
+        extension_operation: SumcheckCoefficients {
+            quartic: median_seconds_per_unit(&sumcheck.quartic),
+            quintic: median_seconds_per_unit(&sumcheck.quintic),
+            octic: median_seconds_per_unit(&sumcheck.octic),
+        },
+        pow_check: pow.seconds_per_unit,
+    };
 
     let calibration = Calibration {
-        schema_version: 2,
+        schema_version: 3,
         provenance: collect_provenance(enabled_features()).expect("collect benchmark provenance"),
         measurement_kind: "poseidon_schedule_component_calibration",
         units: "seconds",
@@ -196,7 +242,13 @@ fn main() {
         target_cpu_native: env::var("RUSTFLAGS")
             .map(|flags| flags.contains("target-cpu=native"))
             .unwrap_or(false),
+        rayon_threads: current_num_threads(),
         features: enabled_features().to_owned(),
+        hash_profile: if cfg!(feature = "poseidon1") {
+            "poseidon1"
+        } else {
+            "poseidon2"
+        },
         args: CalibrationArgs {
             min_log_size: args.min_log_size,
             max_log_size: args.max_log_size,
@@ -207,6 +259,7 @@ fn main() {
             row_width: args.row_width,
         },
         coefficients,
+        verifier_coefficients,
         measurements: Measurements {
             dft,
             merkle,
@@ -214,6 +267,8 @@ fn main() {
             row_opening,
             sumcheck,
             pow,
+            verifier_merkle_hash,
+            verifier_leaf_hash,
         },
         validation: Validation {
             max_relative_error: DEFAULT_VALIDATION_TOLERANCE,
@@ -366,6 +421,46 @@ fn measure_pow(pow_attempts_log2: usize, repeats: usize) -> PointMeasurement {
         timings.push(start.elapsed());
     }
     point("pow_check_witness", attempts as u128, median(timings))
+}
+
+fn measure_verifier_merkle_hash(hashes: usize, repeats: usize) -> PointMeasurement {
+    let compressor = poseidon_merkle_compress();
+    let mut timings = Vec::with_capacity(repeats);
+    for repeat in 0..repeats {
+        let mut left = [F::ZERO; 8];
+        let mut right = [F::ZERO; 8];
+        left[0] = F::from_u32(repeat as u32 + 1);
+        right[0] = F::from_u32(repeat as u32 + 17);
+        let start = Instant::now();
+        for i in 0..hashes {
+            let digest = compressor.compress([left, right]);
+            left = right;
+            right = digest;
+            right[0] += F::from_u32(i as u32 + 1);
+        }
+        let _ = black_box((left, right));
+        timings.push(start.elapsed());
+    }
+    point("verifier_merkle_hash", hashes as u128, median(timings))
+}
+
+fn measure_verifier_leaf_hash(width: usize, hashes: usize, repeats: usize) -> PointMeasurement {
+    let hasher = poseidon_merkle_hash();
+    let mut timings = Vec::with_capacity(repeats);
+    for repeat in 0..repeats {
+        let mut row = field_vec(width, repeat as u32 + 41);
+        let start = Instant::now();
+        for i in 0..hashes {
+            let digest = hasher.hash_slice(&row);
+            row[i % width] += digest[i % digest.len()];
+            let _ = black_box(digest);
+        }
+        let _ = black_box(row);
+        timings.push(start.elapsed());
+    }
+    let mut measurement = point("", (width * hashes) as u128, median(timings));
+    measurement.label = format!("verifier_leaf_hash_width_{width}");
+    measurement
 }
 
 fn field_vec(len: usize, seed: u32) -> Vec<F> {

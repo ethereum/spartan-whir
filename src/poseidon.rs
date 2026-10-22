@@ -880,13 +880,19 @@ where
 }
 
 mod witness_generator {
+    #[cfg(any(unix, windows))]
+    use alloc::format;
     use alloc::{string::String, vec};
     use core::{
         ffi::{c_int, c_void},
         fmt,
         ptr::NonNull,
     };
+    #[cfg(any(unix, windows))]
+    use libloading::Library;
     use p3_field::PrimeCharacteristicRing;
+    #[cfg(any(unix, windows))]
+    use std::path::Path;
 
     use super::*;
     use crate::circom::{validate_satisfaction, CircomAdapterError, KOALABEAR_MODULUS};
@@ -938,6 +944,8 @@ mod witness_generator {
         circuit: NonNull<c_void>,
         generate: LinkedWitnessGeneratorFn,
         free: LinkedWitnessFreeCircuitFn,
+        #[cfg(any(unix, windows))]
+        _library: Option<Library>,
     }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -956,6 +964,57 @@ mod witness_generator {
         },
         Circom(CircomAdapterError),
         Protocol(SpartanWhirError),
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub enum PoseidonWitnessLibraryError {
+        LibraryLoadFailed {
+            name: &'static str,
+            message: String,
+        },
+        SymbolLoadFailed {
+            name: &'static str,
+            symbol: String,
+            message: String,
+        },
+        Generator(PoseidonWitnessGeneratorError),
+    }
+
+    impl fmt::Display for PoseidonWitnessLibraryError {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            match self {
+                Self::LibraryLoadFailed { name, message } => {
+                    write!(
+                        f,
+                        "native witness library for {name} failed to load: {message}"
+                    )
+                }
+                Self::SymbolLoadFailed {
+                    name,
+                    symbol,
+                    message,
+                } => write!(
+                    f,
+                    "native witness library for {name} failed to resolve symbol {symbol}: {message}"
+                ),
+                Self::Generator(error) => fmt::Display::fmt(error, f),
+            }
+        }
+    }
+
+    impl std::error::Error for PoseidonWitnessLibraryError {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            match self {
+                Self::Generator(error) => Some(error),
+                _ => None,
+            }
+        }
+    }
+
+    impl From<PoseidonWitnessGeneratorError> for PoseidonWitnessLibraryError {
+        fn from(error: PoseidonWitnessGeneratorError) -> Self {
+            Self::Generator(error)
+        }
     }
 
     impl fmt::Debug for PoseidonWitnessGenerator {
@@ -1010,6 +1069,61 @@ mod witness_generator {
     }
 
     impl PoseidonWitnessGenerator {
+        /// Load a native witness library and initialize its circuit handle.
+        ///
+        /// Resolves `{symbol_prefix}_load_circuit`, `{symbol_prefix}_linked_witness`,
+        /// and `{symbol_prefix}_free_circuit` using the documented callback ABI.
+        /// The generator retains the library until after its circuit handle is freed.
+        ///
+        /// # Safety
+        ///
+        /// The library must be trusted, including native initialization and
+        /// termination routines run when it is loaded or unloaded. The exported
+        /// symbols must have the exact documented callback signatures and satisfy
+        /// the safety requirements of [`Self::linked`].
+        #[cfg(any(unix, windows))]
+        pub unsafe fn load_library(
+            name: &'static str,
+            library_path: impl AsRef<Path>,
+            symbol_prefix: &str,
+            circuit_data: &[u8],
+        ) -> Result<Self, PoseidonWitnessLibraryError> {
+            let library = unsafe { Library::new(library_path.as_ref()) }.map_err(|error| {
+                PoseidonWitnessLibraryError::LibraryLoadFailed {
+                    name,
+                    message: error.to_string(),
+                }
+            })?;
+            let load_symbol = format!("{symbol_prefix}_load_circuit");
+            let generate_symbol = format!("{symbol_prefix}_linked_witness");
+            let free_symbol = format!("{symbol_prefix}_free_circuit");
+            let load = unsafe { library.get::<LinkedWitnessLoadCircuitFn>(load_symbol.as_bytes()) }
+                .map(|symbol| *symbol)
+                .map_err(|error| PoseidonWitnessLibraryError::SymbolLoadFailed {
+                    name,
+                    symbol: load_symbol,
+                    message: error.to_string(),
+                })?;
+            let generate =
+                unsafe { library.get::<LinkedWitnessGeneratorFn>(generate_symbol.as_bytes()) }
+                    .map(|symbol| *symbol)
+                    .map_err(|error| PoseidonWitnessLibraryError::SymbolLoadFailed {
+                        name,
+                        symbol: generate_symbol,
+                        message: error.to_string(),
+                    })?;
+            let free = unsafe { library.get::<LinkedWitnessFreeCircuitFn>(free_symbol.as_bytes()) }
+                .map(|symbol| *symbol)
+                .map_err(|error| PoseidonWitnessLibraryError::SymbolLoadFailed {
+                    name,
+                    symbol: free_symbol,
+                    message: error.to_string(),
+                })?;
+            let mut generator = unsafe { Self::linked(name, circuit_data, load, generate, free) }?;
+            generator._library = Some(library);
+            Ok(generator)
+        }
+
         /// Construct a witness generator from linked native callbacks.
         ///
         /// # Safety
@@ -1046,6 +1160,8 @@ mod witness_generator {
                 circuit,
                 generate,
                 free,
+                #[cfg(any(unix, windows))]
+                _library: None,
             })
         }
 
@@ -1205,5 +1321,6 @@ mod witness_generator {
 
 pub use witness_generator::{
     LinkedWitnessFreeCircuitFn, LinkedWitnessGeneratorFn, LinkedWitnessLoadCircuitFn,
-    PoseidonWitnessGenerator, PoseidonWitnessGeneratorError, LINKED_WITNESS_GENERATOR_OK,
+    PoseidonWitnessGenerator, PoseidonWitnessGeneratorError, PoseidonWitnessLibraryError,
+    LINKED_WITNESS_GENERATOR_OK,
 };

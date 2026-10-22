@@ -8,7 +8,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-use libloading::Library;
 use p3_field::PrimeField32;
 use sha2::{Digest, Sha256};
 use spartan_whir::{
@@ -34,11 +33,6 @@ struct ArtifactPaths {
     circuit_data: Vec<u8>,
     run_name: String,
     reused: bool,
-}
-
-struct LoadedWitnessGenerator {
-    generator: PoseidonWitnessGenerator,
-    _library: Library,
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -134,9 +128,8 @@ fn run_size(
     println!("shape_import_ms: {}", import_elapsed.as_millis());
     spartan_whir::profiling::record_profile_phase("shape_import", import_elapsed);
 
-    let (_validation_witness, validation_public_inputs) = loaded_generator
-        .generator
-        .generate_witness(&input_binary, shape.num_vars, shape.num_io)?;
+    let (_validation_witness, validation_public_inputs) =
+        loaded_generator.generate_witness(&input_binary, shape.num_vars, shape.num_io)?;
     let actual_digest_bits = public_digest_bits(&validation_public_inputs)?;
     let expected_digest_bits = expected_digest_bits(&expected_digest);
     if actual_digest_bits != expected_digest_bits {
@@ -200,7 +193,7 @@ fn run_size(
                                 &format!("direct_sparse_{}", direct.label),
                                 &direct.config,
                                 &shape,
-                                &loaded_generator.generator,
+                                &loaded_generator,
                                 &input_binary,
                             )?;
                         }
@@ -215,7 +208,7 @@ fn run_size(
                             "spark",
                             config,
                             &shape,
-                            &loaded_generator.generator,
+                            &loaded_generator,
                             &input_binary,
                         )?;
                     }
@@ -361,33 +354,17 @@ fn add_include_path_if_exists(command: &mut Command, dir: &Path, marker: &str) {
 
 fn load_linked_witness_generator(
     artifacts: &ArtifactPaths,
-) -> Result<LoadedWitnessGenerator, Box<dyn Error>> {
-    let library = unsafe { Library::new(&artifacts.linked_library)? };
-    let mut load_symbol = format!("{}_load_circuit", artifacts.run_name).into_bytes();
-    load_symbol.push(0);
-    let mut generate_symbol = format!("{}_linked_witness", artifacts.run_name).into_bytes();
-    generate_symbol.push(0);
-    let mut free_symbol = format!("{}_free_circuit", artifacts.run_name).into_bytes();
-    free_symbol.push(0);
-    let load = unsafe { *library.get::<spartan_whir::LinkedWitnessLoadCircuitFn>(&load_symbol)? };
-    let generate =
-        unsafe { *library.get::<spartan_whir::LinkedWitnessGeneratorFn>(&generate_symbol)? };
-    let free = unsafe { *library.get::<spartan_whir::LinkedWitnessFreeCircuitFn>(&free_symbol)? };
-    // SAFETY: the symbols come from `library`, which is retained in the return
-    // value and dropped after the generator.
+) -> Result<PoseidonWitnessGenerator, Box<dyn Error>> {
+    // SAFETY: the circuit library implements the linked witness ABI.
     let generator = unsafe {
-        PoseidonWitnessGenerator::linked(
+        PoseidonWitnessGenerator::load_library(
             "sha256_bench",
+            &artifacts.linked_library,
+            &artifacts.run_name,
             &artifacts.circuit_data,
-            load,
-            generate,
-            free,
         )
     }?;
-    Ok(LoadedWitnessGenerator {
-        generator,
-        _library: library,
-    })
+    Ok(generator)
 }
 
 fn dynamic_library_name(size: usize) -> String {

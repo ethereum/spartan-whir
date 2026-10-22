@@ -127,9 +127,13 @@ vk.verify(&expected_public_inputs, &proof)?;
 
 DirectSparse authentication validates and hashes the embedded R1CS. Spark authentication also reconstructs the public matrix tables and checks their fixed WHIR commitments.
 
+#### Circom relation import
+
+`import_r1cs_path` and `import_paths` stream KoalaBear Circom R1CS files into Spartan's sparse matrices; byte import APIs are also available.
+
 #### Linked witness generation
 
-`PoseidonWitnessGenerator` loads a generated native witness library once and passes application input bytes directly to the linked function. Public values are ordered as `public_outputs || public_inputs`; the witness buffer contains the remaining witness columns. `prove_from_witness_generator_checked` adds a complete R1CS satisfaction check for diagnostics.
+`PoseidonWitnessGenerator::load_library` loads and owns a native witness library; `linked` accepts caller-managed callbacks. See the API documentation for ABI and safety requirements. `prove_from_witness_generator_checked` adds an R1CS satisfaction check for diagnostics.
 
 #### Relation and transcript binding
 

@@ -1,7 +1,7 @@
 use std::{
     fmt,
     fs::File,
-    io::Read,
+    io::{self, BufReader, Cursor, Read, Seek, SeekFrom},
     path::Path,
     string::{String, ToString},
     vec::Vec,
@@ -171,27 +171,36 @@ pub fn import_paths(
     r1cs_path: impl AsRef<Path>,
     wtns_path: impl AsRef<Path>,
 ) -> Result<ImportedCircuit, CircomAdapterError> {
-    let r1cs = read_path_bounded(r1cs_path, "R1CS file")?;
-    let wtns = read_path_bounded(wtns_path, "witness file")?;
-    import_bytes(&r1cs, &wtns)
+    let r1cs = import_r1cs_path(r1cs_path)?;
+    let (witness, public_inputs) = import_witness_path(&r1cs.shape, wtns_path)?;
+    Ok((r1cs.shape, witness, public_inputs))
 }
 
 pub fn import_bytes(r1cs: &[u8], wtns: &[u8]) -> Result<ImportedCircuit, CircomAdapterError> {
     validate_file_size(r1cs, "R1CS file")?;
     validate_file_size(wtns, "witness file")?;
-    let r1cs = parse_r1cs(r1cs)?;
+    let r1cs = import_r1cs_bytes(r1cs)?;
     let witness = parse_wtns(wtns)?;
-    import_parsed(r1cs, witness)
+    let (witness, public_inputs) = import_witness_values(&r1cs.shape, witness)?;
+    Ok((r1cs.shape, witness, public_inputs))
 }
 
+/// Import a KoalaBear R1CS file with two passes into the final sparse matrices.
 pub fn import_r1cs_path(r1cs_path: impl AsRef<Path>) -> Result<CircomR1cs, CircomAdapterError> {
-    let r1cs = read_path_bounded(r1cs_path, "R1CS file")?;
-    import_r1cs_bytes(&r1cs)
+    let file = File::open(r1cs_path)?;
+    let length = file.metadata()?.len();
+    ensure_limit(
+        "R1CS file",
+        length.min(MAX_CIRCOM_FILE_BYTES as u64 + 1) as usize,
+        MAX_CIRCOM_FILE_BYTES,
+    )?;
+    let mut reader = BufReader::with_capacity(1 << 20, file);
+    import_r1cs_reader(&mut reader, length)
 }
 
 pub fn import_r1cs_bytes(r1cs: &[u8]) -> Result<CircomR1cs, CircomAdapterError> {
     validate_file_size(r1cs, "R1CS file")?;
-    build_circom_r1cs(parse_r1cs(r1cs)?)
+    import_r1cs_reader(&mut Cursor::new(r1cs), r1cs.len() as u64)
 }
 
 pub fn import_witness_path(
@@ -270,32 +279,74 @@ fn split_witness_values_with_layout(
     Ok((witness, public_inputs))
 }
 
-fn import_parsed(
-    r1cs: ParsedR1cs,
-    witness_values: Vec<F>,
-) -> Result<ImportedCircuit, CircomAdapterError> {
-    let circom_r1cs = build_circom_r1cs(r1cs)?;
-    let (witness, public_inputs) = import_witness_values(&circom_r1cs.shape, witness_values)?;
-    Ok((circom_r1cs.shape, witness, public_inputs))
-}
+fn import_r1cs_reader(
+    reader: &mut (impl Read + Seek),
+    length: u64,
+) -> Result<CircomR1cs, CircomAdapterError> {
+    if read_r1cs_bytes::<4>(reader)? != *R1CS_MAGIC {
+        return Err(CircomAdapterError::InvalidMagic("r1cs"));
+    }
+    let version = read_r1cs_u32(reader)?;
+    if version != 1 {
+        return Err(CircomAdapterError::UnsupportedVersion {
+            format: "r1cs",
+            version,
+        });
+    }
+    let sections = read_r1cs_sections(reader, length)?;
+    for section in &sections {
+        match section.id {
+            1 | 2 | 3 => {}
+            id => return Err(CircomAdapterError::UnsupportedSection { id }),
+        }
+    }
+    let header_section = r1cs_section(&sections, 1)?;
+    reader.seek(SeekFrom::Start(header_section.start))?;
+    let mut header_bytes = [0u8; 36];
+    let header_length = header_section.length.min(header_bytes.len() as u64) as usize;
+    read_r1cs_exact(reader, &mut header_bytes[..header_length])?;
+    let header = parse_r1cs_header(&header_bytes[..header_length])?;
+    let constraint_section = r1cs_section(&sections, 2)?;
 
-fn build_circom_r1cs(r1cs: ParsedR1cs) -> Result<CircomR1cs, CircomAdapterError> {
-    let num_io = r1cs
-        .header
+    reader.seek(SeekFrom::Start(constraint_section.start))?;
+    let counts = {
+        let mut constraints = reader.take(constraint_section.length);
+        if header.number_of_constraints as u64 > constraints.limit() / 12 {
+            return Err(CircomAdapterError::UnexpectedEof);
+        }
+        let mut counts = [0usize; 3];
+        let mut total_terms = 0usize;
+        for _ in 0..header.number_of_constraints {
+            for count in &mut counts {
+                let terms = read_r1cs_u32(&mut constraints)? as usize;
+                add_r1cs_terms(&mut total_terms, terms)?;
+                if terms as u64 > constraints.limit() / 8 {
+                    return Err(CircomAdapterError::UnexpectedEof);
+                }
+                *count += terms;
+                for _ in 0..terms {
+                    let term = read_r1cs_bytes::<8>(&mut constraints)?;
+                    let _ = parse_field(&term[4..])?;
+                }
+            }
+        }
+        counts
+    };
+
+    let num_io = header
         .public_outputs
-        .checked_add(r1cs.header.public_inputs)
+        .checked_add(header.public_inputs)
         .ok_or(CircomAdapterError::InvalidShape)?;
     let one_plus_io = num_io
         .checked_add(1)
         .ok_or(CircomAdapterError::InvalidShape)?;
     let non_private_wires = one_plus_io
-        .checked_add(r1cs.header.private_inputs)
+        .checked_add(header.private_inputs)
         .ok_or(CircomAdapterError::InvalidShape)?;
-    if non_private_wires > r1cs.header.total_wires {
+    if non_private_wires > header.total_wires {
         return Err(CircomAdapterError::InvalidShape);
     }
-    let num_vars = r1cs
-        .header
+    let num_vars = header
         .total_wires
         .checked_sub(one_plus_io)
         .ok_or(CircomAdapterError::InvalidShape)?;
@@ -303,61 +354,163 @@ fn build_circom_r1cs(r1cs: ParsedR1cs) -> Result<CircomR1cs, CircomAdapterError>
         .checked_add(one_plus_io)
         .ok_or(CircomAdapterError::InvalidShape)?;
 
-    let remap = |wire: usize| -> Result<usize, CircomAdapterError> {
-        if wire >= r1cs.header.total_wires {
-            return Err(CircomAdapterError::InvalidShape);
-        }
-        if wire == 0 {
-            Ok(num_vars)
-        } else if wire <= num_io {
-            Ok(num_vars + wire)
-        } else {
-            Ok(wire - num_io - 1)
-        }
-    };
-
-    let map_matrix = |lcs: &[LinearCombination]| -> Result<SparseMatrix<F>, CircomAdapterError> {
-        let entry_count = lcs.iter().try_fold(0usize, |count, lc| {
-            count
-                .checked_add(lc.terms.len())
-                .ok_or(CircomAdapterError::ResourceLimitExceeded {
-                    resource: "matrix terms",
-                    limit: MAX_CIRCOM_TERMS as u64,
-                    actual: u64::MAX,
-                })
-        })?;
-        ensure_limit("matrix terms", entry_count, MAX_CIRCOM_TERMS)?;
-        let mut entries = try_vec_with_capacity(entry_count, "matrix terms")?;
-        for (row, lc) in lcs.iter().enumerate() {
-            for term in &lc.terms {
-                entries.push(SparseMatEntry {
+    let mut entries: [Vec<SparseMatEntry<F>>; 3] = [
+        try_vec_with_capacity(counts[0], "matrix terms")?,
+        try_vec_with_capacity(counts[1], "matrix terms")?,
+        try_vec_with_capacity(counts[2], "matrix terms")?,
+    ];
+    reader.seek(SeekFrom::Start(constraint_section.start))?;
+    let mut constraints = reader.take(constraint_section.length);
+    let mut total_terms = 0usize;
+    for row in 0..header.number_of_constraints {
+        for (matrix, count) in entries.iter_mut().zip(counts) {
+            let terms = read_r1cs_u32(&mut constraints)? as usize;
+            add_r1cs_terms(&mut total_terms, terms)?;
+            if terms > count.saturating_sub(matrix.len()) {
+                return Err(CircomAdapterError::InvalidShape);
+            }
+            if terms as u64 > constraints.limit() / 8 {
+                return Err(CircomAdapterError::UnexpectedEof);
+            }
+            for _ in 0..terms {
+                let term = read_r1cs_bytes::<8>(&mut constraints)?;
+                let wire = u32::from_le_bytes(term[..4].try_into().unwrap()) as usize;
+                let coefficient = parse_field(&term[4..])?;
+                if wire >= header.total_wires {
+                    return Err(CircomAdapterError::InvalidShape);
+                }
+                let col = if wire == 0 {
+                    num_vars
+                } else if wire <= num_io {
+                    num_vars + wire
+                } else {
+                    wire - num_io - 1
+                };
+                matrix.push(SparseMatEntry {
                     row,
-                    col: remap(term.wire)?,
-                    val: term.coeff,
+                    col,
+                    val: coefficient,
                 });
             }
         }
-        Ok(SparseMatrix {
-            num_rows: r1cs.header.number_of_constraints,
-            num_cols,
-            entries,
-        })
-    };
-
+    }
+    for (matrix, count) in entries.iter().zip(counts) {
+        if matrix.len() != count {
+            return Err(CircomAdapterError::InvalidShape);
+        }
+    }
+    let [a, b, c] = entries.map(|entries| SparseMatrix {
+        num_rows: header.number_of_constraints,
+        num_cols,
+        entries,
+    });
     let shape = R1csShape {
-        num_cons: r1cs.header.number_of_constraints,
+        num_cons: header.number_of_constraints,
         num_vars,
         num_io,
-        a: map_matrix(&r1cs.a)?,
-        b: map_matrix(&r1cs.b)?,
-        c: map_matrix(&r1cs.c)?,
+        a,
+        b,
+        c,
     };
 
     Ok(CircomR1cs {
         shape,
-        public_outputs: r1cs.header.public_outputs,
-        public_inputs: r1cs.header.public_inputs,
+        public_outputs: header.public_outputs,
+        public_inputs: header.public_inputs,
     })
+}
+
+#[derive(Clone, Copy)]
+struct R1csSection {
+    id: u32,
+    start: u64,
+    length: u64,
+}
+
+fn read_r1cs_sections(
+    reader: &mut (impl Read + Seek),
+    length: u64,
+) -> Result<Vec<R1csSection>, CircomAdapterError> {
+    let count = read_r1cs_u32(reader)? as usize;
+    ensure_limit("sections", count, MAX_CIRCOM_SECTIONS)?;
+    if count as u64 > length.saturating_sub(reader.stream_position()?) / 12 {
+        return Err(CircomAdapterError::UnexpectedEof);
+    }
+    let mut sections = try_vec_with_capacity(count, "sections")?;
+    for _ in 0..count {
+        let id = read_r1cs_u32(reader)?;
+        if sections
+            .iter()
+            .any(|section: &R1csSection| section.id == id)
+        {
+            return Err(CircomAdapterError::DuplicateSection(id));
+        }
+        let section_length = u64::from_le_bytes(read_r1cs_bytes(reader)?);
+        let section_size = usize::try_from(section_length).map_err(|_| {
+            CircomAdapterError::ResourceLimitExceeded {
+                resource: "section bytes",
+                limit: MAX_CIRCOM_FILE_BYTES as u64,
+                actual: section_length,
+            }
+        })?;
+        ensure_limit("section bytes", section_size, MAX_CIRCOM_FILE_BYTES)?;
+        let start = reader.stream_position()?;
+        let end = start
+            .checked_add(section_length)
+            .ok_or(CircomAdapterError::UnexpectedEof)?;
+        if end > length {
+            return Err(CircomAdapterError::UnexpectedEof);
+        }
+        sections.push(R1csSection {
+            id,
+            start,
+            length: section_length,
+        });
+        reader.seek(SeekFrom::Start(end))?;
+    }
+    Ok(sections)
+}
+
+fn r1cs_section(sections: &[R1csSection], id: u32) -> Result<R1csSection, CircomAdapterError> {
+    sections
+        .iter()
+        .find(|section| section.id == id)
+        .copied()
+        .ok_or(CircomAdapterError::MissingSection(id))
+}
+
+fn add_r1cs_terms(total_terms: &mut usize, terms: usize) -> Result<(), CircomAdapterError> {
+    let next_total =
+        total_terms
+            .checked_add(terms)
+            .ok_or(CircomAdapterError::ResourceLimitExceeded {
+                resource: "linear-combination terms",
+                limit: MAX_CIRCOM_TERMS as u64,
+                actual: u64::MAX,
+            })?;
+    ensure_limit("linear-combination terms", next_total, MAX_CIRCOM_TERMS)?;
+    *total_terms = next_total;
+    Ok(())
+}
+
+fn read_r1cs_exact(reader: &mut impl Read, bytes: &mut [u8]) -> Result<(), CircomAdapterError> {
+    reader.read_exact(bytes).map_err(|error| {
+        if error.kind() == io::ErrorKind::UnexpectedEof {
+            CircomAdapterError::UnexpectedEof
+        } else {
+            error.into()
+        }
+    })
+}
+
+fn read_r1cs_bytes<const N: usize>(reader: &mut impl Read) -> Result<[u8; N], CircomAdapterError> {
+    let mut bytes = [0u8; N];
+    read_r1cs_exact(reader, &mut bytes)?;
+    Ok(bytes)
+}
+
+fn read_r1cs_u32(reader: &mut impl Read) -> Result<u32, CircomAdapterError> {
+    Ok(u32::from_le_bytes(read_r1cs_bytes(reader)?))
 }
 
 /// Validate an imported Circom witness against a Spartan-WHIR R1CS shape.
@@ -390,14 +543,6 @@ pub fn validate_satisfaction(
     Ok(())
 }
 
-#[derive(Debug, Clone)]
-struct ParsedR1cs {
-    header: R1csHeader,
-    a: Vec<LinearCombination>,
-    b: Vec<LinearCombination>,
-    c: Vec<LinearCombination>,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct R1csHeader {
     total_wires: usize,
@@ -408,44 +553,9 @@ struct R1csHeader {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct LinearCombination {
-    terms: Vec<Term>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct Term {
-    wire: usize,
-    coeff: F,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 struct Section<'a> {
     id: u32,
     data: &'a [u8],
-}
-
-fn parse_r1cs(bytes: &[u8]) -> Result<ParsedR1cs, CircomAdapterError> {
-    let mut reader = Reader::new(bytes);
-    if reader.take(4)? != R1CS_MAGIC {
-        return Err(CircomAdapterError::InvalidMagic("r1cs"));
-    }
-    let version = reader.u32()?;
-    if version != 1 {
-        return Err(CircomAdapterError::UnsupportedVersion {
-            format: "r1cs",
-            version,
-        });
-    }
-    let sections = read_sections(&mut reader)?;
-    for section in &sections {
-        match section.id {
-            1 | 2 | 3 => {}
-            id => return Err(CircomAdapterError::UnsupportedSection { id }),
-        }
-    }
-    let header = parse_r1cs_header(section(&sections, 1)?)?;
-    let (a, b, c) = parse_constraints(section(&sections, 2)?, &header)?;
-    Ok(ParsedR1cs { header, a, b, c })
 }
 
 fn parse_r1cs_header(bytes: &[u8]) -> Result<R1csHeader, CircomAdapterError> {
@@ -483,60 +593,6 @@ fn parse_r1cs_header(bytes: &[u8]) -> Result<R1csHeader, CircomAdapterError> {
         private_inputs,
         number_of_constraints,
     })
-}
-
-type ConstraintTriples = (
-    Vec<LinearCombination>,
-    Vec<LinearCombination>,
-    Vec<LinearCombination>,
-);
-
-fn parse_constraints(
-    bytes: &[u8],
-    header: &R1csHeader,
-) -> Result<ConstraintTriples, CircomAdapterError> {
-    let mut reader = Reader::new(bytes);
-    if header.number_of_constraints > reader.remaining() / 12 {
-        return Err(CircomAdapterError::UnexpectedEof);
-    }
-    let mut a = try_vec_with_capacity(header.number_of_constraints, "A constraints")?;
-    let mut b = try_vec_with_capacity(header.number_of_constraints, "B constraints")?;
-    let mut c = try_vec_with_capacity(header.number_of_constraints, "C constraints")?;
-    let mut total_terms = 0usize;
-    for _ in 0..header.number_of_constraints {
-        a.push(parse_lc(&mut reader, &mut total_terms)?);
-        b.push(parse_lc(&mut reader, &mut total_terms)?);
-        c.push(parse_lc(&mut reader, &mut total_terms)?);
-    }
-    Ok((a, b, c))
-}
-
-fn parse_lc(
-    reader: &mut Reader<'_>,
-    total_terms: &mut usize,
-) -> Result<LinearCombination, CircomAdapterError> {
-    let n = reader.u32()? as usize;
-    let next_total =
-        total_terms
-            .checked_add(n)
-            .ok_or(CircomAdapterError::ResourceLimitExceeded {
-                resource: "linear-combination terms",
-                limit: MAX_CIRCOM_TERMS as u64,
-                actual: u64::MAX,
-            })?;
-    ensure_limit("linear-combination terms", next_total, MAX_CIRCOM_TERMS)?;
-    *total_terms = next_total;
-    if n > reader.remaining() / 8 {
-        return Err(CircomAdapterError::UnexpectedEof);
-    }
-    let mut terms = try_vec_with_capacity(n, "linear-combination terms")?;
-    for _ in 0..n {
-        terms.push(Term {
-            wire: reader.u32()? as usize,
-            coeff: parse_field(reader.take(4)?)?,
-        });
-    }
-    Ok(LinearCombination { terms })
 }
 
 fn parse_wtns(bytes: &[u8]) -> Result<Vec<F>, CircomAdapterError> {
@@ -959,13 +1015,11 @@ mod tests {
 
     #[test]
     fn rejects_oversized_linear_combination_before_allocation() {
-        let mut bytes = Vec::new();
-        u32_le(&mut bytes, (MAX_CIRCOM_TERMS + 1) as u32);
-        let mut reader = Reader::new(&bytes);
-        let mut total_terms = 0;
+        let mut bytes = sample_r1cs(false, KOALABEAR_MODULUS);
+        bytes[72..76].copy_from_slice(&((MAX_CIRCOM_TERMS + 1) as u32).to_le_bytes());
 
         assert_eq!(
-            parse_lc(&mut reader, &mut total_terms),
+            import_r1cs_bytes(&bytes),
             Err(CircomAdapterError::ResourceLimitExceeded {
                 resource: "linear-combination terms",
                 limit: MAX_CIRCOM_TERMS as u64,
@@ -994,6 +1048,511 @@ mod tests {
                 resource: "witness values",
                 limit: MAX_CIRCOM_DIMENSION as u64,
                 actual: (MAX_CIRCOM_DIMENSION + 1) as u64,
+            })
+        );
+    }
+}
+
+#[cfg(test)]
+mod streaming_import_tests {
+    use super::*;
+    use std::{
+        fs::{self, OpenOptions},
+        io::{self, BufReader, Read, Seek, SeekFrom, Write},
+        path::{Path, PathBuf},
+        sync::atomic::{AtomicU64, Ordering},
+    };
+
+    struct TemporaryFile(PathBuf);
+
+    impl TemporaryFile {
+        fn new(bytes: &[u8]) -> Self {
+            static NEXT: AtomicU64 = AtomicU64::new(0);
+            let path = std::env::temp_dir().join(format!(
+                "spartan-whir-import-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+                .unwrap();
+            file.write_all(bytes).unwrap();
+            Self(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TemporaryFile {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(&self.0);
+        }
+    }
+
+    fn fixture_sections() -> Vec<(u32, Vec<u8>)> {
+        let mut header = Vec::new();
+        for value in [4u32, KOALABEAR_MODULUS, 5, 1, 1, 1] {
+            header.extend(value.to_le_bytes());
+        }
+        header.extend(5u64.to_le_bytes());
+        header.extend(2u32.to_le_bytes());
+        let mut constraints = Vec::new();
+        for terms in [
+            vec![(3u32, 1u32), (0, 0), (3, 2)],
+            vec![(4, 1)],
+            vec![(1, 1)],
+            vec![(2, 1)],
+            vec![(0, 1)],
+            vec![(2, 1)],
+        ] {
+            constraints.extend((terms.len() as u32).to_le_bytes());
+            for (wire, coefficient) in terms {
+                constraints.extend(wire.to_le_bytes());
+                constraints.extend(coefficient.to_le_bytes());
+            }
+        }
+        let labels = (0..5u64).flat_map(u64::to_le_bytes).collect();
+        vec![(1, header), (2, constraints), (3, labels)]
+    }
+
+    fn encode(sections: &[(u32, Vec<u8>)]) -> Vec<u8> {
+        let mut bytes = b"r1cs".to_vec();
+        bytes.extend(1u32.to_le_bytes());
+        bytes.extend((sections.len() as u32).to_le_bytes());
+        for (id, contents) in sections {
+            bytes.extend(id.to_le_bytes());
+            bytes.extend((contents.len() as u64).to_le_bytes());
+            bytes.extend(contents);
+        }
+        bytes
+    }
+
+    fn entry(row: usize, col: usize, coefficient: u32) -> SparseMatEntry<F> {
+        SparseMatEntry {
+            row,
+            col,
+            val: F::from_u32(coefficient),
+        }
+    }
+
+    fn assert_both_error(bytes: &[u8], expected: CircomAdapterError) {
+        let file = TemporaryFile::new(bytes);
+        assert_eq!(import_r1cs_bytes(bytes), Err(expected.clone()));
+        assert_eq!(import_r1cs_path(file.path()), Err(expected));
+    }
+
+    #[test]
+    fn path_and_bytes_preserve_sections_entries_and_public_metadata() {
+        let original = fixture_sections();
+        let expected = import_r1cs_bytes(&encode(&original)).unwrap();
+        assert_eq!(expected.public_outputs, 1);
+        assert_eq!(expected.public_inputs, 1);
+        assert_eq!(
+            (
+                expected.shape.num_cons,
+                expected.shape.num_vars,
+                expected.shape.num_io
+            ),
+            (2, 2, 2)
+        );
+        assert_eq!(
+            expected.shape.a.entries,
+            vec![
+                entry(0, 0, 1),
+                entry(0, 2, 0),
+                entry(0, 0, 2),
+                entry(1, 4, 1)
+            ]
+        );
+        assert_eq!(
+            expected.shape.b.entries,
+            vec![entry(0, 1, 1), entry(1, 2, 1)]
+        );
+        assert_eq!(
+            expected.shape.c.entries,
+            vec![entry(0, 3, 1), entry(1, 4, 1)]
+        );
+        expected.shape.validate().unwrap();
+
+        for order in [
+            [0, 1, 2],
+            [0, 2, 1],
+            [1, 0, 2],
+            [1, 2, 0],
+            [2, 0, 1],
+            [2, 1, 0],
+        ] {
+            let sections: Vec<_> = order.iter().map(|&i| original[i].clone()).collect();
+            let bytes = encode(&sections);
+            let file = TemporaryFile::new(&bytes);
+            let from_bytes = import_r1cs_bytes(&bytes).unwrap();
+            let from_path = import_r1cs_path(file.path()).unwrap();
+            assert_eq!(from_bytes, expected, "order {order:?}");
+            assert_eq!(from_path, expected, "order {order:?}");
+            validate_satisfaction(
+                &from_path.shape,
+                &R1csWitness {
+                    w: vec![F::ONE, F::from_u32(2)],
+                },
+                &[F::from_u32(6), F::from_u32(5)],
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn pair_import_uses_the_same_layout_for_paths_and_bytes() {
+        let relation = encode(&fixture_sections());
+        let mut witness = b"wtns".to_vec();
+        witness.extend(2u32.to_le_bytes());
+        witness.extend(2u32.to_le_bytes());
+        let mut header = Vec::new();
+        for value in [4u32, KOALABEAR_MODULUS, 5] {
+            header.extend(value.to_le_bytes());
+        }
+        let values: Vec<_> = [1u32, 6, 5, 1, 2]
+            .into_iter()
+            .flat_map(u32::to_le_bytes)
+            .collect();
+        for (id, bytes) in [(1u32, header), (2, values)] {
+            witness.extend(id.to_le_bytes());
+            witness.extend((bytes.len() as u64).to_le_bytes());
+            witness.extend(bytes);
+        }
+        let relation_file = TemporaryFile::new(&relation);
+        let witness_file = TemporaryFile::new(&witness);
+        let expected = import_bytes(&relation, &witness).unwrap();
+        assert_eq!(
+            import_paths(relation_file.path(), witness_file.path()).unwrap(),
+            expected
+        );
+        assert_eq!(expected.1.w, vec![F::ONE, F::from_u32(2)]);
+        assert_eq!(expected.2, vec![F::from_u32(6), F::from_u32(5)]);
+    }
+
+    #[test]
+    fn preserves_optional_label_maps_and_ignored_trailing_bytes() {
+        let sections = fixture_sections();
+        let expected = import_r1cs_bytes(&encode(&sections)).unwrap();
+        let mut cases = vec![sections[..2].to_vec()];
+        let mut empty_map = sections.clone();
+        empty_map[2].1.clear();
+        cases.push(empty_map);
+        let mut arbitrary_map = sections.clone();
+        arbitrary_map[2].1 = vec![7, 8, 9];
+        cases.push(arbitrary_map);
+        let mut trailing = sections;
+        trailing[0].1.extend([0xaa, 0xbb]);
+        trailing[1].1.extend([0xcc, 0xdd]);
+        cases.push(trailing);
+        for sections in cases {
+            let mut bytes = encode(&sections);
+            bytes.extend([0xee, 0xff]);
+            let file = TemporaryFile::new(&bytes);
+            assert_eq!(import_r1cs_bytes(&bytes).unwrap(), expected);
+            assert_eq!(import_r1cs_path(file.path()).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn streamed_coefficients_keep_canonical_boundaries_and_error_precedence() {
+        let mut sections = fixture_sections();
+        sections[1].1[8..12].copy_from_slice(&(KOALABEAR_MODULUS - 1).to_le_bytes());
+        let bytes = encode(&sections);
+        let file = TemporaryFile::new(&bytes);
+        let imported = import_r1cs_bytes(&bytes).unwrap();
+        assert_eq!(
+            imported.shape.a.entries[0].val,
+            F::from_u32(KOALABEAR_MODULUS - 1)
+        );
+        assert_eq!(import_r1cs_path(file.path()).unwrap(), imported);
+
+        // Wire remapping follows parsing every coefficient in the relation.
+        // A later malformed coefficient retains precedence over an invalid wire.
+        sections[1].1[4..8].copy_from_slice(&5u32.to_le_bytes());
+        sections[1].1[24..28].copy_from_slice(&KOALABEAR_MODULUS.to_le_bytes());
+        assert_both_error(&encode(&sections), CircomAdapterError::InvalidFieldElement);
+        sections[1].1[24..28].copy_from_slice(&2u32.to_le_bytes());
+        assert_both_error(&encode(&sections), CircomAdapterError::InvalidShape);
+    }
+
+    #[test]
+    fn every_truncated_relation_prefix_retains_unexpected_eof() {
+        let bytes = encode(&fixture_sections());
+        for length in 0..bytes.len() {
+            assert_both_error(&bytes[..length], CircomAdapterError::UnexpectedEof);
+        }
+    }
+
+    #[test]
+    fn malformed_sections_keep_existing_error_variants() {
+        let sections = fixture_sections();
+        for id in [1u32, 2] {
+            let missing: Vec<_> = sections
+                .iter()
+                .filter(|(kind, _)| *kind != id)
+                .cloned()
+                .collect();
+            assert_both_error(&encode(&missing), CircomAdapterError::MissingSection(id));
+        }
+        for id in [1u32, 2, 3] {
+            let mut duplicate = sections.clone();
+            duplicate.push(sections[(id - 1) as usize].clone());
+            assert_both_error(
+                &encode(&duplicate),
+                CircomAdapterError::DuplicateSection(id),
+            );
+        }
+        for id in [4u32, 5, 9] {
+            let mut unknown = sections.clone();
+            unknown.push((id, Vec::new()));
+            assert_both_error(
+                &encode(&unknown),
+                CircomAdapterError::UnsupportedSection { id },
+            );
+        }
+        let mut bad_magic = encode(&sections);
+        bad_magic[0] ^= 1;
+        assert_both_error(&bad_magic, CircomAdapterError::InvalidMagic("r1cs"));
+        let mut version = encode(&sections);
+        version[4..8].copy_from_slice(&2u32.to_le_bytes());
+        assert_both_error(
+            &version,
+            CircomAdapterError::UnsupportedVersion {
+                format: "r1cs",
+                version: 2,
+            },
+        );
+        let mut too_many = b"r1cs".to_vec();
+        too_many.extend(1u32.to_le_bytes());
+        too_many.extend(((MAX_CIRCOM_SECTIONS + 1) as u32).to_le_bytes());
+        assert_both_error(
+            &too_many,
+            CircomAdapterError::ResourceLimitExceeded {
+                resource: "sections",
+                limit: MAX_CIRCOM_SECTIONS as u64,
+                actual: (MAX_CIRCOM_SECTIONS + 1) as u64,
+            },
+        );
+        let mut oversized_section = b"r1cs".to_vec();
+        oversized_section.extend(1u32.to_le_bytes());
+        oversized_section.extend(1u32.to_le_bytes());
+        oversized_section.extend(1u32.to_le_bytes());
+        oversized_section.extend((MAX_CIRCOM_FILE_BYTES as u64 + 1).to_le_bytes());
+        assert_both_error(
+            &oversized_section,
+            CircomAdapterError::ResourceLimitExceeded {
+                resource: "section bytes",
+                limit: MAX_CIRCOM_FILE_BYTES as u64,
+                actual: MAX_CIRCOM_FILE_BYTES as u64 + 1,
+            },
+        );
+    }
+
+    #[test]
+    fn header_bounds_and_layout_errors_match_for_paths_and_bytes() {
+        for (offset, resource) in [
+            (8, "wires"),
+            (12, "public outputs"),
+            (16, "public inputs"),
+            (20, "private inputs"),
+            (32, "constraints"),
+        ] {
+            let mut sections = fixture_sections();
+            sections[0].1[offset..offset + 4]
+                .copy_from_slice(&((MAX_CIRCOM_DIMENSION + 1) as u32).to_le_bytes());
+            assert_both_error(
+                &encode(&sections),
+                CircomAdapterError::ResourceLimitExceeded {
+                    resource,
+                    limit: MAX_CIRCOM_DIMENSION as u64,
+                    actual: (MAX_CIRCOM_DIMENSION + 1) as u64,
+                },
+            );
+        }
+        let mut labels = fixture_sections();
+        labels[0].1[24..32].copy_from_slice(&(MAX_CIRCOM_DIMENSION as u64 + 1).to_le_bytes());
+        assert_both_error(
+            &encode(&labels),
+            CircomAdapterError::ResourceLimitExceeded {
+                resource: "labels",
+                limit: MAX_CIRCOM_DIMENSION as u64,
+                actual: MAX_CIRCOM_DIMENSION as u64 + 1,
+            },
+        );
+        let mut width = fixture_sections();
+        width[0].1[..4].copy_from_slice(&8u32.to_le_bytes());
+        assert_both_error(
+            &encode(&width),
+            CircomAdapterError::InvalidFieldSize {
+                expected: 4,
+                actual: 8,
+            },
+        );
+        let mut modulus = fixture_sections();
+        modulus[0].1[4..8].copy_from_slice(&(KOALABEAR_MODULUS - 1).to_le_bytes());
+        assert_both_error(
+            &encode(&modulus),
+            CircomAdapterError::InvalidModulus {
+                expected: KOALABEAR_MODULUS,
+                actual: (KOALABEAR_MODULUS - 1).to_le_bytes().to_vec(),
+            },
+        );
+        for (offset, value) in [(8, 0u32), (12, 5), (20, 3)] {
+            let mut sections = fixture_sections();
+            sections[0].1[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+            assert_both_error(&encode(&sections), CircomAdapterError::InvalidShape);
+        }
+    }
+
+    #[test]
+    fn rejects_oversized_lc_through_the_public_importer_before_allocation() {
+        let mut sections = fixture_sections();
+        sections[1].1[..4].copy_from_slice(&((MAX_CIRCOM_TERMS + 1) as u32).to_le_bytes());
+        assert_both_error(
+            &encode(&sections),
+            CircomAdapterError::ResourceLimitExceeded {
+                resource: "linear-combination terms",
+                limit: MAX_CIRCOM_TERMS as u64,
+                actual: (MAX_CIRCOM_TERMS + 1) as u64,
+            },
+        );
+    }
+
+    #[test]
+    fn aggregate_term_limit_is_inclusive_and_rejects_arithmetic_overflow() {
+        let third = MAX_CIRCOM_TERMS / 3;
+        let mut total = 0;
+        for count in [third, third, MAX_CIRCOM_TERMS - 2 * third, 0] {
+            add_r1cs_terms(&mut total, count).unwrap();
+        }
+        assert_eq!(total, MAX_CIRCOM_TERMS);
+        assert_eq!(
+            add_r1cs_terms(&mut total, 1),
+            Err(CircomAdapterError::ResourceLimitExceeded {
+                resource: "linear-combination terms",
+                limit: MAX_CIRCOM_TERMS as u64,
+                actual: MAX_CIRCOM_TERMS as u64 + 1
+            })
+        );
+        let mut overflow = usize::MAX;
+        assert_eq!(
+            add_r1cs_terms(&mut overflow, 1),
+            Err(CircomAdapterError::ResourceLimitExceeded {
+                resource: "linear-combination terms",
+                limit: MAX_CIRCOM_TERMS as u64,
+                actual: u64::MAX
+            })
+        );
+    }
+
+    // Only the header and three LC counts occupy memory. Missing payload bytes
+    // read as zero. Reading beyond the final count fails before matrix reserve,
+    // so a broken aggregate limit cannot allocate millions of sparse entries.
+    struct SparseInput {
+        position: u64,
+        length: u64,
+        fail_at: u64,
+        blocks: Vec<(u64, Vec<u8>)>,
+        read_past_count: bool,
+    }
+
+    impl Read for SparseInput {
+        fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+            if out.is_empty() {
+                return Ok(0);
+            }
+            if self.position >= self.fail_at {
+                self.read_past_count = true;
+                return Err(io::Error::other("read after final LC count"));
+            }
+            let count = (out.len() as u64)
+                .min(self.length - self.position)
+                .min(self.fail_at - self.position) as usize;
+            out[..count].fill(0);
+            for (offset, bytes) in &self.blocks {
+                let begin = self.position.max(*offset);
+                let end = (self.position + count as u64).min(*offset + bytes.len() as u64);
+                if begin < end {
+                    out[(begin - self.position) as usize..(end - self.position) as usize]
+                        .copy_from_slice(
+                            &bytes[(begin - offset) as usize..(end - offset) as usize],
+                        );
+                }
+            }
+            self.position += count as u64;
+            Ok(count)
+        }
+    }
+
+    impl Seek for SparseInput {
+        fn seek(&mut self, from: SeekFrom) -> io::Result<u64> {
+            let position = match from {
+                SeekFrom::Start(position) => i128::from(position),
+                SeekFrom::End(offset) => i128::from(self.length) + i128::from(offset),
+                SeekFrom::Current(offset) => i128::from(self.position) + i128::from(offset),
+            };
+            self.position = u64::try_from(position)
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid seek"))?;
+            Ok(self.position)
+        }
+    }
+
+    #[test]
+    fn production_reader_enforces_the_total_term_cap_across_all_three_matrices() {
+        let mut header = fixture_sections()[0].1.clone();
+        header[32..36].copy_from_slice(&1u32.to_le_bytes());
+        let mut prefix = encode(&[(1, header)]);
+        prefix[8..12].copy_from_slice(&2u32.to_le_bytes());
+        prefix.extend(2u32.to_le_bytes());
+        prefix.extend((12 + 8 * (MAX_CIRCOM_TERMS as u64 + 1)).to_le_bytes());
+        let mut position = prefix.len() as u64;
+        let mut blocks = vec![(0, prefix)];
+        let counts = [MAX_CIRCOM_TERMS / 2, MAX_CIRCOM_TERMS / 2, 1];
+        let mut fail_at = 0;
+        for count in counts {
+            blocks.push((position, (count as u32).to_le_bytes().to_vec()));
+            fail_at = position + 4;
+            position += 4 + 8 * count as u64;
+        }
+        let input = SparseInput {
+            position: 0,
+            length: position,
+            fail_at,
+            blocks,
+            read_past_count: false,
+        };
+        let mut reader = BufReader::with_capacity(1 << 20, input);
+        assert_eq!(
+            import_r1cs_reader(&mut reader, position),
+            Err(CircomAdapterError::ResourceLimitExceeded {
+                resource: "linear-combination terms",
+                limit: MAX_CIRCOM_TERMS as u64,
+                actual: MAX_CIRCOM_TERMS as u64 + 1
+            })
+        );
+        assert!(!reader.get_ref().read_past_count);
+    }
+
+    #[test]
+    fn oversized_path_is_rejected_from_metadata_before_reading_its_payload() {
+        let file = TemporaryFile::new(&[]);
+        OpenOptions::new()
+            .write(true)
+            .open(file.path())
+            .unwrap()
+            .set_len(MAX_CIRCOM_FILE_BYTES as u64 + 1)
+            .unwrap();
+        assert_eq!(
+            import_r1cs_path(file.path()),
+            Err(CircomAdapterError::ResourceLimitExceeded {
+                resource: "R1CS file",
+                limit: MAX_CIRCOM_FILE_BYTES as u64,
+                actual: MAX_CIRCOM_FILE_BYTES as u64 + 1
             })
         );
     }

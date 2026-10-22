@@ -113,7 +113,8 @@ pub use poseidon::{
 };
 pub use poseidon::{
     LinkedWitnessFreeCircuitFn, LinkedWitnessGeneratorFn, LinkedWitnessLoadCircuitFn,
-    PoseidonWitnessGenerator, PoseidonWitnessGeneratorError, LINKED_WITNESS_GENERATOR_OK,
+    PoseidonWitnessGenerator, PoseidonWitnessGeneratorError, PoseidonWitnessLibraryError,
+    LINKED_WITNESS_GENERATOR_OK,
 };
 pub use poseidon_trace::{
     PoseidonTranscriptEvent, PoseidonTranscriptTrace, TraceablePoseidonChallenger,

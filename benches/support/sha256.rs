@@ -1,6 +1,5 @@
 use std::{env, error::Error, fs, path::PathBuf};
 
-use libloading::Library;
 use p3_field::PrimeField32;
 use sha2::{Digest, Sha256};
 use spartan_whir::{engine::F, import_r1cs_path, PoseidonWitnessGenerator, R1csShape};
@@ -8,7 +7,6 @@ use spartan_whir::{engine::F, import_r1cs_path, PoseidonWitnessGenerator, R1csSh
 pub struct Sha256Fixture {
     pub shape: R1csShape<F>,
     pub generator: PoseidonWitnessGenerator,
-    _library: Library,
 }
 
 impl Sha256Fixture {
@@ -35,44 +33,19 @@ impl Sha256Fixture {
         }
 
         let shape = import_r1cs_path(&r1cs)?.shape;
-        let library = unsafe { Library::new(&linked_library)? };
         let run_name = format!("sha256_{size}b");
-        let load = unsafe {
-            *library.get::<spartan_whir::LinkedWitnessLoadCircuitFn>(&symbol(
-                &run_name,
-                "load_circuit",
-            ))?
-        };
-        let generate = unsafe {
-            *library.get::<spartan_whir::LinkedWitnessGeneratorFn>(&symbol(
-                &run_name,
-                "linked_witness",
-            ))?
-        };
-        let free = unsafe {
-            *library.get::<spartan_whir::LinkedWitnessFreeCircuitFn>(&symbol(
-                &run_name,
-                "free_circuit",
-            ))?
-        };
         let circuit_data = fs::read(circuit_data_path)?;
-        // SAFETY: the symbols come from the loaded circuit library, which is
-        // retained in the fixture and dropped after the generator.
+        // SAFETY: the cached circuit library implements the linked witness ABI.
         let generator = unsafe {
-            PoseidonWitnessGenerator::linked(
+            PoseidonWitnessGenerator::load_library(
                 "sha256_full_zk_criterion",
+                &linked_library,
+                &run_name,
                 &circuit_data,
-                load,
-                generate,
-                free,
             )
         }?;
 
-        Ok(Self {
-            shape,
-            generator,
-            _library: library,
-        })
+        Ok(Self { shape, generator })
     }
 
     pub fn validate_input(&self, message: &[u8], input: &[u8]) -> Result<(), Box<dyn Error>> {
@@ -132,10 +105,4 @@ fn dynamic_library_name(size: usize) -> String {
         env::consts::DLL_PREFIX,
         env::consts::DLL_EXTENSION
     )
-}
-
-fn symbol(run_name: &str, suffix: &str) -> Vec<u8> {
-    let mut value = format!("{run_name}_{suffix}").into_bytes();
-    value.push(0);
-    value
 }

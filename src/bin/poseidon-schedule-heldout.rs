@@ -6,7 +6,6 @@ use std::{
     time::Instant,
 };
 
-use libloading::Library;
 use p3_challenger::{CanObserve, CanSampleUniformBits, FieldChallenger, GrindingChallenger};
 use p3_field::TwoAdicField;
 use p3_maybe_rayon::prelude::current_num_threads;
@@ -16,8 +15,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use spartan_whir::{
     engine::{ExtField, F},
-    import_paths, import_r1cs_path, validate_satisfaction, LinkedWitnessFreeCircuitFn,
-    LinkedWitnessGeneratorFn, LinkedWitnessLoadCircuitFn, MlePcs, Plonky3WhirPcs,
+    import_paths, import_r1cs_path, validate_satisfaction, MlePcs, Plonky3WhirPcs,
     PoseidonSetupConfig, PoseidonWitnessGenerator, PoseidonZkSetupConfig, QuarticBinExtension,
     R1csShape, R1csWitness,
 };
@@ -250,7 +248,6 @@ enum InputSource {
 
 struct LinkedInputSource {
     generator: PoseidonWitnessGenerator,
-    _library: Library,
     base_input: Vec<u8>,
     randomize_bits: bool,
 }
@@ -318,48 +315,13 @@ fn load_linked_input_source(args: &Args) -> Result<(R1csShape<F>, InputSource), 
         .as_deref()
         .ok_or_else(|| "--linked-run-name is required for linked witness input".to_owned())?;
 
-    let library = unsafe { Library::new(&args.linked_witness_library) }.map_err(|err| {
-        format!(
-            "failed to load {}: {err}",
-            args.linked_witness_library.display()
-        )
-    })?;
-    let load_symbol = linked_symbol(run_name, "load_circuit");
-    let generate_symbol = linked_symbol(run_name, "linked_witness");
-    let free_symbol = linked_symbol(run_name, "free_circuit");
-    let load = unsafe { library.get::<LinkedWitnessLoadCircuitFn>(&load_symbol) }
-        .map_err(|err| {
-            format!(
-                "failed to load symbol {}: {err}",
-                display_symbol(&load_symbol)
-            )
-        })
-        .map(|symbol| *symbol)?;
-    let generate = unsafe { library.get::<LinkedWitnessGeneratorFn>(&generate_symbol) }
-        .map_err(|err| {
-            format!(
-                "failed to load symbol {}: {err}",
-                display_symbol(&generate_symbol)
-            )
-        })
-        .map(|symbol| *symbol)?;
-    let free = unsafe { library.get::<LinkedWitnessFreeCircuitFn>(&free_symbol) }
-        .map_err(|err| {
-            format!(
-                "failed to load symbol {}: {err}",
-                display_symbol(&free_symbol)
-            )
-        })
-        .map(|symbol| *symbol)?;
-    // SAFETY: the callbacks come from `library`, which remains loaded until
-    // after the generator is dropped.
+    // SAFETY: the selected circuit library implements the linked witness ABI.
     let generator = unsafe {
-        PoseidonWitnessGenerator::linked(
+        PoseidonWitnessGenerator::load_library(
             "poseidon_schedule_heldout",
+            &args.linked_witness_library,
+            run_name,
             &circuit_data,
-            load,
-            generate,
-            free,
         )
     }
     .map_err(|err| format!("failed to initialize linked witness generator: {err}"))?;
@@ -388,21 +350,10 @@ fn load_linked_input_source(args: &Args) -> Result<(R1csShape<F>, InputSource), 
         imported.shape,
         InputSource::Linked(LinkedInputSource {
             generator,
-            _library: library,
             base_input,
             randomize_bits: args.randomize_linked_input_bits,
         }),
     ))
-}
-
-fn linked_symbol(run_name: &str, suffix: &str) -> Vec<u8> {
-    let mut symbol = format!("{run_name}_{suffix}").into_bytes();
-    symbol.push(0);
-    symbol
-}
-
-fn display_symbol(symbol: &[u8]) -> String {
-    String::from_utf8_lossy(symbol.strip_suffix(&[0]).unwrap_or(symbol)).into_owned()
 }
 
 fn nonempty_path(path: &PathBuf) -> Option<&Path> {
